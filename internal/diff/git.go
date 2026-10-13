@@ -6,7 +6,6 @@ package diff
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -126,16 +125,25 @@ func NewWorkspaceProvider(repoDir string, runner *gitcmd.Runner) *Provider {
 	}
 }
 
-// InputResolution carries this run's frozen, immutable commit endpoints, per the
+// InputResolution carries this run's frozen, immutable VCS endpoints, per the
 // run-manifest input-mode matrix. An empty field means "not applicable or not
-// resolvable" — a root commit and a merge commit have no single comparison base,
-// an unborn workspace has no HEAD, and a workspace has no immutable head — and a
-// caller must never treat an empty value as a real endpoint or fabricate one.
-// ExactRange is populated only when both a unique base and a head resolve.
+// resolvable" — a Git root commit and merge commit have no single comparison
+// base, an unborn workspace has no HEAD, and a workspace has no immutable head.
+// ExactRange is populated only when both a unique base and head resolve.
+// RepositorySourceTarget, RepositoryTarget, RepositoryRoot, and RepositoryUUID
+// are runtime-only SVN routing metadata. Numeric SourcePegRevision and
+// TargetPegRevision values are safe to copy into the manifest; target URLs are
+// never copied into a manifest or session log.
 type InputResolution struct {
-	ResolvedBase string
-	ResolvedHead string
-	ExactRange   string
+	ResolvedBase           string
+	ResolvedHead           string
+	ExactRange             string
+	RepositorySourceTarget string
+	RepositoryTarget       string
+	RepositoryRoot         string
+	RepositoryUUID         string
+	SourcePegRevision      string
+	TargetPegRevision      string
 }
 
 // ResolveInput freezes this run's commit endpoints by asking git, following the
@@ -453,6 +461,25 @@ func (p *Provider) partitionDiffs(diffs []model.Diff) DiffSet {
 	return result
 }
 
+// filterDiffs applies built-in directory rules and .gitignore patterns to
+// remove excluded diffs. Unlike partitionDiffs, it discards excluded entries
+// rather than separating them for reporting. Non-Git providers reuse this
+// through a synthetic Provider to share the same exclusion logic.
+func (p *Provider) filterDiffs(diffs []model.Diff) []model.Diff {
+	patterns := p.loadGitignorePatterns()
+	var result []model.Diff
+	for _, d := range diffs {
+		path := d.NewPath
+		if path == "/dev/null" {
+			path = d.OldPath
+		}
+		if !isProviderDirExcluded(path) && !p.isPathExcluded(path, patterns) {
+			result = append(result, d)
+		}
+	}
+	return result
+}
+
 // ---- Internal helpers ----
 
 func (p *Provider) computeMergeBase(ctx context.Context, from, to string) string {
@@ -657,49 +684,7 @@ func (p *Provider) untrackedFileDiffs(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var results []string
-	for _, f := range files {
-		content, rerr := readWorkspaceFileForDiffWithLimit(p.repoDir, f, maxUntrackedFileSize)
-		if errors.Is(rerr, errWorkspaceFileTooLarge) {
-			results = append(results, untrackedBinaryDiff(f))
-			continue
-		}
-		if rerr != nil {
-			continue
-		}
-
-		if looksBinary(content) {
-			// Emit git's own binary marker so the parser flags the file and
-			// the selection layer excludes it, matching the tracked path where
-			// `git diff` itself reports "Binary files ... differ".
-			results = append(results, untrackedBinaryDiff(f))
-			continue
-		}
-
-		lineCount := bytes.Count(content, []byte{'\n'})
-		if len(content) > 0 && content[len(content)-1] != '\n' {
-			lineCount++
-		}
-
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("diff --git a/%s b/%s\n", f, f))
-		sb.WriteString("--- /dev/null\n")
-		sb.WriteString(fmt.Sprintf("+++ b/%s\n", f))
-		sb.WriteString(fmt.Sprintf("@@ -0,0 +1,%d @@\n", lineCount))
-
-		lines := bytes.Split(content, []byte{'\n'})
-		if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
-			lines = lines[:len(lines)-1]
-		}
-		for _, line := range lines {
-			sb.WriteByte('+')
-			sb.Write(line)
-			sb.WriteByte('\n')
-		}
-		results = append(results, sb.String())
-	}
-	return results, nil
+	return workspaceFileDiffs(p.repoDir, files), nil
 }
 
 func (p *Provider) untrackedFilesList(ctx context.Context) ([]string, error) {

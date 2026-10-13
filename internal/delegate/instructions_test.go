@@ -121,8 +121,11 @@ func readDelegateExamples(root fs.FS, docs []string) ([]string, error) {
 			return nil, fmt.Errorf("%s: %w", doc, err)
 		}
 		set := map[string]bool{}
-		for _, example := range exampleRE.FindAllString(string(content), -1) {
-			set[example] = true
+		for _, match := range exampleRE.FindAllStringIndex(string(content), -1) {
+			if match[0] > 0 && content[match[0]-1] == '-' {
+				continue
+			}
+			set[string(content)[match[0]:match[1]]] = true
 		}
 		var examples []string
 		for example := range set {

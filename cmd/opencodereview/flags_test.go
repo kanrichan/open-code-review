@@ -150,6 +150,31 @@ func TestParseReviewFlags_ConflictingModes(t *testing.T) {
 	}
 }
 
+func TestParseReviewFlags_SVNRemoteTargets(t *testing.T) {
+	args := []string{
+		"--from", "7", "--to", "9",
+		"--svn-from-target", "https://svn.example.com/repo/trunk@7",
+		"--svn-to-target", "https://svn.example.com/repo/branches/feature@9",
+	}
+	opts, err := parseReviewFlags(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.svnFromTarget != args[5] || opts.svnToTarget != args[7] {
+		t.Fatalf("parsed SVN targets = %q, %q", opts.svnFromTarget, opts.svnToTarget)
+	}
+}
+
+func TestParseReviewFlags_RejectsIncompleteSVNRemoteTargets(t *testing.T) {
+	_, err := parseReviewFlags([]string{
+		"--from", "7", "--to", "9",
+		"--svn-from-target", "https://svn.example.com/repo/trunk@7",
+	})
+	if err == nil || !strings.Contains(err.Error(), "must be provided together") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestParseReviewFlags_FromWithoutTo(t *testing.T) {
 	_, err := parseReviewFlags([]string{"--from", "main"})
 	if err == nil {

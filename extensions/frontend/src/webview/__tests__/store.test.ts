@@ -19,7 +19,7 @@ describe('reducer', () => {
     const s = reducer(initialState, {
       type: 'init',
       config: baseConfig,
-      gitState: { branches: [], currentBranch: 'main', recentCommits: [], workspaceFiles: [] },
+      gitState: { vcs: 'git', branches: [], currentBranch: 'main', recentCommits: [], workspaceFiles: [] },
     });
     expect(s.config?.llm.model).toBe('m');
     expect(s.gitState.currentBranch).toBe('main');
@@ -29,7 +29,7 @@ describe('reducer', () => {
   it('init with null config keeps the main view idle', () => {
     const s = reducer(initialState, {
       type: 'init', config: null,
-      gitState: { branches: [], currentBranch: '', recentCommits: [], workspaceFiles: [] },
+      gitState: { vcs: 'unknown', branches: [], currentBranch: '', recentCommits: [], workspaceFiles: [] },
     });
     expect(s.view).toBe('idle');
   });
@@ -37,11 +37,11 @@ describe('reducer', () => {
   it('init / gitState / modeFiles stop loading; the filesLoading action starts it', () => {
     const init = reducer({ ...initialState, filesLoading: true }, {
       type: 'init', config: null,
-      gitState: { branches: [], currentBranch: '', recentCommits: [], workspaceFiles: [] },
+      gitState: { vcs: 'unknown', branches: [], currentBranch: '', recentCommits: [], workspaceFiles: [] },
     });
     expect(init.filesLoading).toBe(false);
 
-    const started = reducer(init, { type: 'filesLoading' });
+    const started = reducer(init, { type: 'filesLoading', requestId: 1 });
     expect(started.filesLoading).toBe(true);
 
     const loaded = reducer(started, { type: 'gitState', gitState: init.gitState });
@@ -154,10 +154,23 @@ describe('modeFiles message', () => {
   it('stores the file list for the mode', () => {
     const next = reducer(initialState, {
       type: 'modeFiles',
+      requestId: 0,
       mode: ReviewMode.Branch,
       files: [{ path: 'src/a.ts', status: 'modified' }],
     });
     expect(next.modeFiles).toEqual([{ path: 'src/a.ts', status: 'modified' }]);
+  });
+
+  it('ignores stale modeFiles responses', () => {
+    const waiting = reducer(initialState, { type: 'filesLoading', requestId: 2 });
+    const stale = reducer(waiting, {
+      type: 'modeFiles',
+      requestId: 1,
+      mode: ReviewMode.Branch,
+      files: [{ path: 'stale.ts', status: 'modified' }],
+    });
+    expect(stale.modeFiles).toEqual([]);
+    expect(stale.filesLoading).toBe(true);
   });
 
   it('modeFiles starts as an empty array on init', () => {

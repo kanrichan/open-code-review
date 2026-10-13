@@ -103,7 +103,9 @@ repository root. It cannot be combined with `background`.
   the tool API has no abort signal, so cancellation relies on the overall
   timeout).
 - OCR credentials remain in the existing OCR configuration or environment.
-- Workspace mode includes staged, unstaged, and untracked files.
+- Workspace mode includes Git staged/unstaged/untracked files or SVN versioned/unversioned files.
+- `commit`, `from`, and `to` accept Git refs or exact SVN revisions. SVN inputs are frozen to numeric endpoints and never use Git merge-base semantics.
+- Exact remote SVN path ranges use paired `svnFromTarget` / `svnToTarget` values. Configure SVN authentication and certificate trust outside the URL.
 
 ## Development
 

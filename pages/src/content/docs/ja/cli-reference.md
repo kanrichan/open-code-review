@@ -88,7 +88,7 @@ ocr review --commit HEAD | gh issue comment 123 --body-file -
 
 ## `ocr review`
 
-メインコマンドです。Git diff を解析し、意味的に関連するファイルをグループにまとめ、グループごとにサブエージェントをディスパッチし、レビューコメントを収集して出力します。
+メインコマンドです。Git または Subversion ワーキングコピーの diff を解析し、意味的に関連するファイルをグループにまとめ、グループごとにサブエージェントをディスパッチし、レビューコメントを収集して出力します。
 
 ### 概要
 
@@ -97,16 +97,18 @@ ocr review [flags]
 ocr r      [flags]   (alias)
 ```
 
-引数を何も渡さない場合、OCR は**ワークスペースモード**で動作します。カレントディレクトリのリポジトリ内にある staged + unstaged + untracked のすべての変更をレビューします。
+引数を何も渡さない場合、OCR は**ワークスペースモード**で動作し、カレントディレクトリにある Git または Subversion ワーキングコピーのローカル変更をすべてレビューします。
 
 ### 引数
 
 | 引数 | 短縮形 | デフォルト | 説明 |
 |---|---|---|---|
-| `--repo <path>` | — | カレントディレクトリ | Git リポジトリのルート。 |
-| `--from <ref>` | — | — | diff の開始 ref（例: `main`）。 |
-| `--to <ref>` | — | — | diff の終了 ref（例: `feature-branch`）。設定すると OCR は `merge-base(from, to)..to` を計算します。 |
-| `--commit <sha>` | `-c` | — | 単一の commit をレビューします（その親との差分）。 |
+| `--repo <path>` | — | カレントディレクトリ | Git リポジトリまたは Subversion ワーキングコピーのルート。明示的なリモート SVN 比較では、OCR のルール／設定を置く通常のディレクトリも指定できます。 |
+| `--from <ref>` | — | — | 開始 Git ref または SVN revision。Git は merge-base、SVN は解決済みの正確な revision を使用します。 |
+| `--to <ref>` | — | — | 宛先 Git ref または SVN revision。Git は `merge-base(from, to)..to` を計算し、SVN は正確な端点を比較します。 |
+| `--commit <ref>` | `-c` | — | 単一の Git commit または SVN revision を直前の端点と比較してレビューします。 |
+| `--svn-from-target <url[@peg]>` | — | — | リモート範囲比較のソース SVN ディレクトリ。`--svn-to-target` および `--from`/`--to` と組み合わせます。 |
+| `--svn-to-target <url[@peg]>` | — | — | 宛先 SVN ディレクトリ。ファイルツールは固定済みの operative/peg revision からこの対象を読み取ります。 |
 | `--preview` | `-p` | `false` | フィルタリングのパイプラインを実行しますが LLM はスキップします。ファイル一覧と除外理由を出力します。`--format json` に対応しています。`--format sarif` はサポートされていません（プレビューには出力する完了した指摘がありません）。 |
 | `--no-filter` | — | `false` | すべてのレビューコメントを保持し、サブタスクごとの `REVIEW_FILTER_TASK` LLM 後処理呼び出しをスキップします。サブタスクは単一ファイル、または関連ファイルのまとまりをレビューします。 |
 | `--resume <session-id>` | — | — | 以前の互換性のある範囲または単一 commit レビューセッションから再開します。 |
@@ -162,12 +164,33 @@ stderr に警告を出し、検証は provider に任せます。カスタム pr
 ocr review
 ```
 
-OCR は 2 つの git コマンドからワークツリーの変更を組み立てます:
+Git では、OCR は 2 つのコマンドからワークツリーの変更を組み立てます:
 
 - `git diff HEAD` で追跡済みの変更を取得します（staged + unstaged をまとめて `HEAD` と比較。空の場合は `git diff --staged` にフォールバック）
 - `git ls-files --others --exclude-standard` で untracked ファイルを取得し、ディスクから読み込んでファイル全体の新規追加として扱います
 
 これは通常、commit 前に確認したい内容そのものです。より小さな範囲が必要なら、選択的に stage してください。
+
+Subversion ワーキングコピーでは、OCR は最初に `svn --version --quiet` で機能を確認します。
+使用する Git 互換 diff 機能にはクライアント 1.7 以降が必要です。ワークスペースモードでは、
+`svn diff --git` の出力と `svn status --xml` が報告する未管理ファイルを結合します。
+行単位で特定できるソース変更がないため、プロパティのみの変更は無視されます。
+
+SVN ワークスペースの境界ケースは次のように扱われます。
+
+- copy はファイル全体の追加として表示され、リポジトリルート相対の copy-from パスと
+  リビジョンが付与されます。move はコピー元付きの追加と独立した削除、replacement も
+  削除と追加として表示されます。
+- バイナリ内容の変更と MIME で指定されたバイナリファイルは binary として識別されます。
+  executable、EOL、MIME などプロパティだけの変更は行単位のソース変更がないため無視されます。
+  内容も変更された場合は内容またはバイナリの変更を残し、プロパティ本文だけを除きます。
+- 各ノードをそれぞれの BASE と比較するため、mixed-BASE-revision ワーキングコピーは対応します。
+  switched、sparse、obstructed、incomplete、conflicted の状態は diff 読み込み前に拒否されます。
+- `svn:externals` の定義またはチェックアウト済み external ノードは拒否されます。ファイルツールが
+  選択したリポジトリ境界を越えないよう、各 external のワーキングコピー根で OCR を別に実行してください。
+- Windows のコンソール出力で Unicode が失われる場合は XML パスを正とします。名前の空白と `@` は
+  保持され、SVN コマンドは `--` の後でワーキングコピー根だけを対象にするため peg 構文に誤認されません。
+- 検査はファイルごとのプロセスではなく固定数の再帰 SVN コマンドを使い、逐次・有界・キャンセル可能です。
 
 #### 範囲モード
 
@@ -177,6 +200,42 @@ ocr review --from main --to feature-branch
 
 OCR は `merge-base(main, feature-branch)..feature-branch` を計算するため、feature ブランチが*導入した* diff だけが表示されます。ブランチを切ったあとに `main` へ入った無関係な変更は含まれません。
 
+SVN では両方の値が revision であり、OCR は固定された正確な端点を比較します。
+
+```bash
+ocr review --from 120 --to 128
+```
+
+数値 revision、`HEAD`、`{DATE}` revision を使用できます。可動値または日付値は、
+diff の読み込み、ファイルツール、フィルタリング、manifest 作成、resume identity の
+確認より前にリポジトリ全体の数値へ解決されます。`BASE`、`COMMITTED`、`PREV` は
+混在 revision のワーキングコピーで曖昧になるため拒否されます。
+
+trunk とサーバー側 merge 後のブランチなど、2 つのリポジトリパスを比較する場合は、
+両方の対象を明示します。
+
+```bash
+ocr review \
+  --repo ./ocr-config \
+  --from 120 \
+  --to 128 \
+  --svn-from-target 'https://svn.example.com/repos/app/trunk@120' \
+  --svn-to-target 'https://svn.example.com/repos/app/branches/feature@128'
+```
+
+これは厳密な SVN 比較です。operative revision は `120:128`、2 つの `@PEG` は履歴上の
+ソース／宛先パスを識別します。OCR は Git merge base を作りません。両対象は同じ SVN
+リポジトリ内のディレクトリでなければなりません。絶対 URL ならワーキングコピーは不要です。
+`^/` 対象では `--repo` が SVN ワーキングコピーを指す必要があります。
+
+`HEAD` と `{DATE}` を含む operative/peg の表記は、`svn diff`、`svn cat`、filter、
+resume identity の計算より前に 1 回だけ数値へ解決されます。diff パスは選択した 2 つの
+ディレクトリに対して正規化され、宛先内容はディスクではなく常に `--svn-to-target` から
+読み取られます。hook がプロンプトで停止しないようコマンドは `--non-interactive` で実行されます。
+hook アカウント用の SVN 認証キャッシュとサーバー証明書の信頼を事前設定してください。
+userinfo、query string、fragment を含む URL は拒否され、対象 URL は manifest、session log、
+delegate JSON、telemetry に保存されません。
+
 #### Commit モード
 
 ```bash
@@ -185,6 +244,10 @@ ocr review -c abc123
 ```
 
 `git show abc123` が生成する diff（すなわちその commit が導入した変更）をレビューします。
+
+SVN では `--commit 128` がワーキングコピー URL の正確な `127:128` の変更をレビューします。
+revision 0 には直前の端点がないため空の入力です。新規ファイルの内容とリポジトリ検索ツールは、
+現在のワークツリーではなく revision 128 を読み取ります。
 
 ### 中断したレビューの再開
 
@@ -517,7 +580,7 @@ CI ジョブで確認を省略するには `--yes`（`-y`）を渡してくだ�
 ocr rules check [flags] <file-path>
 
 Flags:
-  --repo <path>    Git repository root (default: current dir)
+  --repo <path>    Git/SVN working-copy root, or config directory for scan/remote SVN (default: current dir)
   --rule <path>    Path to a custom rule JSON file
 ```
 

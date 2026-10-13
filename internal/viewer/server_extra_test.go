@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/alibaba/open-code-review/internal/session"
 )
 
 func TestParseTemplate_ReposHTML(t *testing.T) {
@@ -247,7 +249,7 @@ func TestRenderTemplate_SessionsTableMockup(t *testing.T) {
 
 	// Every th carries scope="col": the session cell no longer repeats the word
 	// "Session", so the header is what tells a screen reader what the column holds.
-	const header = `<thead><tr><th scope="col">Session ID</th><th scope="col">Branch</th><th scope="col">Mode</th><th scope="col">Model</th>` +
+	const header = `<thead><tr><th scope="col">Session ID</th><th scope="col">VCS</th><th scope="col">Branch</th><th scope="col">Mode</th><th scope="col">Input</th><th scope="col">Model</th>` +
 		`<th scope="col">Files</th><th scope="col">Status</th><th scope="col">Comments</th><th scope="col">Duration</th><th scope="col">Started At</th><th scope="col" class="col-action">Action</th></tr></thead>`
 	for _, want := range []string{
 		header,
@@ -282,6 +284,30 @@ func TestRenderTemplate_SessionsTableMockup(t *testing.T) {
 	}
 	if strings.Contains(body, "<script>") {
 		t.Error("sessions page must not carry an inline script")
+	}
+}
+
+func TestRenderTemplate_SessionsTableMockupSVN(t *testing.T) {
+	rr := httptest.NewRecorder()
+	renderTemplate(rr, "sessions.html", sessionsData{
+		EncodedRepo: "test-repo",
+		RepoName:    "MyProject",
+		Sessions: []SessionSummary{
+			{
+				SessionID:  "svn-session",
+				VCS:        "svn",
+				ReviewMode: "range",
+				DiffFrom:   "120",
+				DiffTo:     "128",
+			},
+			{SessionID: "legacy-git", GitBranch: "main"},
+		},
+	})
+	body := rr.Body.String()
+	for _, want := range []string{"svn", "120..128", ">git<"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected SVN session metadata %q in sessions template", want)
+		}
 	}
 }
 
@@ -466,9 +492,19 @@ func TestRenderTemplate_SessionPage(t *testing.T) {
 	rr := httptest.NewRecorder()
 	vs := &ViewSession{
 		Summary: SessionSummary{
-			SessionID: "abc",
-			Model:     "gpt-4",
-			CWD:       "/test",
+			SessionID:  "abc",
+			Model:      "gpt-4",
+			CWD:        "/test",
+			VCS:        "svn",
+			ReviewMode: "commit",
+			DiffCommit: "128",
+			RunManifest: &session.RunManifest{Input: session.ManifestInput{
+				ResolvedBase:    "127",
+				ResolvedHead:    "128",
+				ExactRange:      "127:128",
+				ResolvedBasePeg: "127",
+				ResolvedHeadPeg: "128",
+			}},
 		},
 		Files: []*FileGroup{
 			{
@@ -502,6 +538,11 @@ func TestRenderTemplate_SessionPage(t *testing.T) {
 	}
 	if !strings.Contains(body, `<a href="/r/repo">MyRepo</a>`) {
 		t.Errorf("expected breadcrumb navigation to remain in session template")
+	}
+	for _, want := range []string{"<strong>VCS:</strong> svn", "<strong>Revision:</strong> <code>128</code>", "<strong>Resolved base:</strong> <code>127</code>", "<strong>Head peg:</strong> <code>128</code>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected SVN input metadata %q in session template", want)
+		}
 	}
 }
 
@@ -585,6 +626,22 @@ func TestRenderTemplate_SessionHeaderStatusClasses(t *testing.T) {
 				t.Errorf("expected %q in rendered status markup", tc.wantClass)
 			}
 		})
+	}
+}
+
+func TestRenderTemplate_LegacyGitSessionInfersVCS(t *testing.T) {
+	rr := httptest.NewRecorder()
+	renderTemplate(rr, "session.html", sessionPageData{
+		EncodedRepo: "repo",
+		RepoName:    "MyRepo",
+		Session: &ViewSession{Summary: SessionSummary{
+			SessionID: "legacy",
+			GitBranch: "main",
+		}},
+	})
+
+	if !strings.Contains(rr.Body.String(), "<strong>VCS:</strong> git") {
+		t.Fatal("legacy Git session should infer VCS from its branch")
 	}
 }
 

@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/alibaba/open-code-review/internal/agent"
 	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/delegate"
 	"github.com/alibaba/open-code-review/internal/diff"
 	"github.com/alibaba/open-code-review/internal/tool"
+	"github.com/alibaba/open-code-review/internal/vcs"
 	"github.com/spf13/cobra"
 )
 
@@ -22,6 +24,8 @@ type delegateOptions struct {
 	from           string
 	to             string
 	commit         string
+	svnFromTarget  string
+	svnToTarget    string
 	excludes       string
 	rulePath       string
 	background     string
@@ -43,6 +47,14 @@ Output review spec for host-agent delegation (no LLM required).`,
 	Example: `  # Preview which files will be reviewed
   ocr delegate preview --from main --to feature
 
+  # Preview an immutable SVN revision
+  ocr delegate preview --commit 128
+
+  # Preview an exact remote SVN branch comparison
+  ocr delegate preview --from 120 --to 128 \
+    --svn-from-target https://svn.example.com/repos/app/trunk@120 \
+    --svn-to-target https://svn.example.com/repos/app/branches/feature@128
+
   # Preview workspace changes
   ocr delegate preview
 
@@ -57,7 +69,7 @@ Output review spec for host-agent delegation (no LLM required).`,
 var delegatePreviewCmd = &cobra.Command{
 	Use:   "preview [flags]",
 	Short: "Preview reviewable files with mode/ref metadata",
-	Long:  "Outputs reviewable file list with mode/ref metadata for the host agent to construct git commands.",
+	Long:  "Outputs reviewable file list with mode/ref and version-control metadata for the host agent.",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := validateDelegateOptions(&delegatePreviewOpts); err != nil {
@@ -89,22 +101,36 @@ func init() {
 
 // delegateContext holds the shared state for delegate sub-commands.
 type delegateContext struct {
-	cc   *commonContext
-	opts delegateOptions
+	cc     *commonContext
+	opts   delegateOptions
+	sealed *diff.InputResolution
 }
 
 func loadDelegateContext(opts delegateOptions) (*delegateContext, error) {
+	reviewOpts := reviewOptions{
+		from: opts.from, to: opts.to, commit: opts.commit,
+		svnFromTarget: opts.svnFromTarget, svnToTarget: opts.svnToTarget,
+	}
+	explicitSVNTargets := hasExplicitSVNTargets(reviewOpts)
 	contentRef, _ := tool.ParseReviewMode(opts.from, opts.to, opts.commit).RefValue(opts.to, opts.commit)
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, contentRef, 0, opts.maxGitProcs, true)
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, contentRef, 0, opts.maxGitProcs, !explicitSVNTargets)
 	if err != nil {
 		return nil, err
 	}
+	if explicitSVNTargets {
+		cc.RepositoryKind = vcs.Subversion
+		cc.IsGitRepo = false
+	}
 	applyCLIExcludes(cc, splitPaths(opts.excludes))
 
-	// Security: reject ref-option injection.
-	reviewOpts := reviewOptions{from: opts.from, to: opts.to, commit: opts.commit}
-	if err := validateReviewRefs(cc.RepoDir, reviewOpts); err != nil {
+	// Security: reject ref-option injection before any Git command uses it.
+	if err := validateRepositoryReviewMode(cc.RepositoryKind, reviewOpts); err != nil {
 		return nil, err
+	}
+	if cc.IsGitRepo {
+		if err := validateReviewRefs(cc.RepoDir, reviewOpts); err != nil {
+			return nil, err
+		}
 	}
 
 	bg, err := resolveBackground(cc.RepoDir, opts.background, opts.backgroundFile, opts.commit)
@@ -112,8 +138,14 @@ func loadDelegateContext(opts delegateOptions) (*delegateContext, error) {
 		return nil, err
 	}
 	opts.background = bg
+	resolveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sealed, err := resolveSVNReviewInput(resolveCtx, cc, reviewOpts)
+	if err != nil {
+		return nil, err
+	}
 
-	return &delegateContext{cc: cc, opts: opts}, nil
+	return &delegateContext{cc: cc, opts: opts, sealed: sealed}, nil
 }
 
 // preview runs the agent's file-selection logic and returns the preview result.
@@ -123,18 +155,22 @@ func loadDelegateContext(opts delegateOptions) (*delegateContext, error) {
 // not the limit that applies to delegated work.
 func (dc *delegateContext) preview(ctx context.Context) (*agent.DiffPreview, error) {
 	return agent.Preview(ctx, agent.Args{
-		RepoDir:    dc.cc.RepoDir,
-		From:       dc.opts.from,
-		To:         dc.opts.to,
-		Commit:     dc.opts.commit,
-		FileFilter: dc.cc.FileFilter,
-		GitRunner:  dc.cc.GitRunner,
+		RepoDir:        dc.cc.RepoDir,
+		RepositoryKind: dc.cc.RepositoryKind,
+		From:           dc.opts.from,
+		To:             dc.opts.to,
+		Commit:         dc.opts.commit,
+		SVNFromTarget:  dc.opts.svnFromTarget,
+		SVNToTarget:    dc.opts.svnToTarget,
+		FileFilter:     dc.cc.FileFilter,
+		GitRunner:      dc.cc.GitRunner,
+		SealedInput:    dc.sealed,
 	})
 }
 
 // mergeBase computes the merge-base for range mode. Returns "" for other modes.
 func (dc *delegateContext) mergeBase(ctx context.Context) string {
-	if dc.opts.from == "" || dc.opts.to == "" {
+	if dc.cc.RepositoryKind != vcs.Git || dc.opts.from == "" || dc.opts.to == "" {
 		return ""
 	}
 	provider := diff.NewProvider(dc.cc.RepoDir, dc.opts.from, dc.opts.to, dc.cc.GitRunner)
@@ -170,15 +206,29 @@ func executeDelegatePreview(opts delegateOptions) error {
 		return fmt.Errorf("preview failed: %w", err)
 	}
 	mergeBase := dc.mergeBase(ctx)
+	var resolvedBase, resolvedHead, exactRange, resolvedBasePeg, resolvedHeadPeg string
+	if dc.sealed != nil {
+		resolvedBase = dc.sealed.ResolvedBase
+		resolvedHead = dc.sealed.ResolvedHead
+		exactRange = dc.sealed.ExactRange
+		resolvedBasePeg = dc.sealed.SourcePegRevision
+		resolvedHeadPeg = dc.sealed.TargetPegRevision
+	}
 	if opts.format == "json" {
 		return writeDelegateJSON(delegatePreviewJSON{
 			SchemaVersion:   delegateSchemaVersion,
+			VCS:             string(dc.cc.RepositoryKind),
 			Mode:            dc.reviewMode(),
 			Repository:      dc.cc.RepoDir,
 			From:            dc.opts.from,
 			To:              dc.opts.to,
 			Commit:          dc.opts.commit,
 			MergeBase:       mergeBase,
+			ResolvedBase:    resolvedBase,
+			ResolvedHead:    resolvedHead,
+			ExactRange:      exactRange,
+			ResolvedBasePeg: resolvedBasePeg,
+			ResolvedHeadPeg: resolvedHeadPeg,
 			Background:      dc.opts.background,
 			TotalFiles:      preview.TotalFiles,
 			ReviewableCount: preview.ReviewableCount,
@@ -192,6 +242,7 @@ func executeDelegatePreview(opts delegateOptions) error {
 
 	fmt.Printf("# Files (%d reviewable / %d total)\n\n", preview.ReviewableCount, preview.TotalFiles)
 	fmt.Printf("- mode: %s\n", dc.reviewMode())
+	fmt.Printf("- vcs: %s\n", dc.cc.RepositoryKind)
 	if dc.opts.from != "" {
 		fmt.Printf("- from: %s\n", dc.opts.from)
 	}
@@ -203,6 +254,21 @@ func executeDelegatePreview(opts delegateOptions) error {
 	}
 	if mergeBase != "" {
 		fmt.Printf("- merge_base: %s\n", mergeBase)
+	}
+	if resolvedBase != "" {
+		fmt.Printf("- resolved_base: %s\n", resolvedBase)
+	}
+	if resolvedHead != "" {
+		fmt.Printf("- resolved_head: %s\n", resolvedHead)
+	}
+	if exactRange != "" {
+		fmt.Printf("- exact_range: %s\n", exactRange)
+	}
+	if resolvedBasePeg != "" {
+		fmt.Printf("- resolved_base_peg: %s\n", resolvedBasePeg)
+	}
+	if resolvedHeadPeg != "" {
+		fmt.Printf("- resolved_head_peg: %s\n", resolvedHeadPeg)
 	}
 	if dc.opts.background != "" {
 		fmt.Printf("- background: %s\n", dc.opts.background)
@@ -255,12 +321,18 @@ type delegatePreviewFileJSON struct {
 
 type delegatePreviewJSON struct {
 	SchemaVersion   string                    `json:"schema_version"`
+	VCS             string                    `json:"vcs"`
 	Mode            string                    `json:"mode"`
 	Repository      string                    `json:"repository"`
 	From            string                    `json:"from,omitempty"`
 	To              string                    `json:"to,omitempty"`
 	Commit          string                    `json:"commit,omitempty"`
 	MergeBase       string                    `json:"merge_base,omitempty"`
+	ResolvedBase    string                    `json:"resolved_base,omitempty"`
+	ResolvedHead    string                    `json:"resolved_head,omitempty"`
+	ExactRange      string                    `json:"exact_range,omitempty"`
+	ResolvedBasePeg string                    `json:"resolved_base_peg,omitempty"`
+	ResolvedHeadPeg string                    `json:"resolved_head_peg,omitempty"`
 	Background      string                    `json:"background,omitempty"`
 	TotalFiles      int                       `json:"total_files"`
 	ReviewableCount int                       `json:"reviewable_count"`

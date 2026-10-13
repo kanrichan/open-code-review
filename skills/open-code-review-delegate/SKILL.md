@@ -11,7 +11,8 @@ compatibility: >
   Requires the `ocr` CLI installed (via `npm install -g
   @alibaba-group/open-code-review` or GitHub release binary). Does NOT
   require a configured LLM endpoint — delegation mode is LLM-free on the
-  OCR side.
+  OCR side. Subversion workflows require an `svn` 1.7 or newer
+  command-line client.
 metadata:
   author: alibaba
   homepage: https://github.com/alibaba/open-code-review
@@ -27,12 +28,13 @@ A skill for performing AI code review where OCR provides deterministic engineeri
 ### Step 1: Preview — Determine What to Review
 
 ```bash
-ocr delegate preview --format json [--from <ref> --to <ref>] [--commit <hash>] [--exclude <patterns>]
+ocr delegate preview --format json [--from <ref> --to <ref>] [--commit <ref>] [--svn-from-target <url[@peg]> --svn-to-target <url[@peg]>] [--exclude <patterns>]
 ```
 
 This outputs:
+- **vcs** (git / svn)
 - **mode** (workspace / range / commit)
-- **from / to / commit / merge_base** — ref metadata for constructing git commands
+- **from / to / commit / merge_base / resolved_base / resolved_head / exact_range / resolved_base_peg / resolved_head_peg** — frozen VCS endpoint metadata
 - **Reviewable file list** — paths, status, insertions/deletions
 - **Excluded files** — with exclusion reason
 
@@ -43,6 +45,9 @@ This outputs:
 | Workspace changes | `ocr delegate preview` |
 | Branch comparison | `ocr delegate preview --from main --to feature` |
 | Single commit | `ocr delegate preview -c abc123` |
+| SVN single revision | `ocr delegate preview -c 128` |
+| SVN revision range | `ocr delegate preview --from 120 --to 128` |
+| Remote SVN path range | `ocr delegate preview --from 120 --to 128 --svn-from-target <old-url@peg> --svn-to-target <new-url@peg>` |
 
 ### Step 2: Get Rules for Files
 
@@ -54,25 +59,37 @@ Pass the reviewable file paths from Step 1. Output is grouped by rule content �
 
 ### Step 3: Get Diffs
 
-Choose the diff command using the mode and refs from Step 1. Use `git --no-pager` for every Git call during the review.
+Choose the diff command using the VCS, mode, and refs from Step 1. Use `git --no-pager` for every Git call during the review.
 
 The diff commands disable external diff programs, text conversion, and color to produce plain patches.
 
-**Range mode** (merge_base provided in preview output):
+**Git range mode** (merge_base provided in preview output):
 ```bash
 git --no-pager diff --no-ext-diff --no-textconv --no-color <merge_base>..<to> -- "<path>"
 ```
 
-**Commit mode**:
+**Git commit mode**:
 ```bash
 git --no-pager show --no-ext-diff --no-textconv --no-color <commit> -- "<path>"
 ```
 
+**SVN range or commit mode** uses the numeric endpoints returned by preview. Read the selected URL from `svn info --xml --non-interactive --depth empty -- .`, then resolve its historical URL at each endpoint before diffing:
+```bash
+svn info --xml --non-interactive --revision <resolved_base> -- <selected-url>@<resolved_base>
+svn info --xml --non-interactive --revision <resolved_head> -- <selected-url>@<resolved_head>
+svn diff --non-interactive --git --internal-diff --show-copies-as-adds --old <base-url-from-info>@<resolved_base> --new <head-url-from-info>@<resolved_head>
+svn cat --non-interactive --revision <resolved_head> -- <head-url-from-info>/<url-escaped-path>@<resolved_head>
+```
+
+For an explicit remote-path range, retain the two validated input targets only in runtime memory: delegate JSON deliberately does not echo them. Resolve each with `svn info --xml --non-interactive --revision <operative-revision> -- <target-url>@<resolved-peg>`, then diff the two returned historical URLs with `--notice-ancestry`. Never invent Git merge-base semantics for SVN.
+
 **Workspace mode**:
 ```bash
-# Tracked files
+# Git tracked files
 git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"
-# New untracked files — read directly (entire file is new code)
+# SVN versioned files
+svn diff --git --internal-diff --show-copies-as-adds -- <path>
+# New untracked/unversioned files — read directly (entire file is new code)
 cat "<path>"
 ```
 
@@ -141,16 +158,18 @@ If the user requested "review and fix":
 
 | Command | Purpose |
 |---------|---------|
-| `ocr delegate preview` | Which files to review + mode/ref metadata |
+| `ocr delegate preview` | Which files to review + VCS/mode/ref metadata |
 | `ocr delegate rule <path...>` | Review rules grouped by content |
 
 ## Shared Flags
 
 | Flag | Description |
 |------|-------------|
-| `--from <ref>` | Source ref for range mode |
-| `--to <ref>` | Target ref for range mode |
-| `-c, --commit <hash>` | Single commit mode |
+| `--from <ref>` | Git source ref or SVN source revision for range mode |
+| `--to <ref>` | Git target ref or SVN target revision for range mode |
+| `--svn-from-target <url[@peg]>` | Source SVN directory for an exact remote range |
+| `--svn-to-target <url[@peg]>` | Destination SVN directory for an exact remote range |
+| `-c, --commit <ref>` | Git commit or SVN repository revision |
 | `--repo <path>` | Repository root (default: cwd) |
 | `--rule <path>` | Custom rule.json path |
 | `--exclude <patterns>` | Comma-separated exclude patterns |
@@ -162,8 +181,10 @@ If the user requested "review and fix":
 
 - **No LLM needed on OCR side** — delegation mode never calls an LLM. All intelligence comes from the host agent.
 - **Rules are grouped** — Files sharing the same rule are grouped together in the output. You can pass any number of paths per call; for large changes, fetch rules per-batch as you review.
-- **Working directory matters** — `ocr delegate` operates on the Git repo at the current directory. Use `--repo /path` to override.
-- **Untracked files in workspace mode** — `preview` includes untracked files. For these, read the file directly instead of using `git diff`.
+- **Working directory matters** — `ocr delegate` operates on the Git repository or SVN working copy at the current directory. Use `--repo /path` to override.
+- **Untracked files in workspace mode** — `preview` includes Git-untracked and SVN-unversioned files. Read these directly instead of using a VCS diff command.
+- **SVN input is exact and immutable** — numeric revisions, `HEAD`, and `{date}` are frozen once. `BASE`, `COMMITTED`, and `PREV` are rejected. Revision 0 has no predecessor and therefore produces an empty single-revision input.
+- **Remote target URLs are runtime-only** — do not print or persist them. Configure credentials and certificate trust in SVN itself; never put username/password userinfo in a target URL.
 - **Background context** — pass `--background` to `preview` when you have requirement context; it appears in the output for your reference during review.
 - **Coverage is mandatory** — every `reviewable_files` entry must end as reviewed or explicitly skipped; do not silently omit files.
 

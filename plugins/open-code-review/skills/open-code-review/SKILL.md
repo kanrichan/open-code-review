@@ -1,7 +1,8 @@
 ---
 name: open-code-review
 description: >
-  Performs AI-powered code review on Git changes using the `ocr` CLI from
+  Performs AI-powered code review on Git changes and Subversion workspace,
+  revision, or remote-path changes using the `ocr` CLI from
   alibaba/open-code-review. Use when the user asks to review code, review
   a pull request, review staged/unstaged changes, review a commit, or
   compare branches for code quality issues. Produces line-level review
@@ -14,6 +15,7 @@ compatibility: >
   @alibaba-group/open-code-review` or GitHub release binary). Requires a
   configured supported LLM provider before first run (protocols: Anthropic,
   OpenAI Chat Completions, OpenAI Responses, AWS Bedrock).
+  Subversion workflows require an `svn` 1.7 or newer command-line client.
 metadata:
   author: alibaba
   homepage: https://github.com/alibaba/open-code-review
@@ -27,7 +29,7 @@ This Codex plugin skill intentionally mirrors the canonical skill at
 OCR agent instructions; a symlink is avoided because plugin installs may only
 materialize the plugin subtree.
 
-A skill for invoking [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) — an open-source AI code review CLI that reads Git diffs and generates structured, line-level review comments.
+A skill for invoking [open-code-review](https://github.com/alibaba/open-code-review) (`ocr`) — an open-source AI code review CLI that reads Git or Subversion diffs and generates structured, line-level review comments.
 
 ## Workflow
 
@@ -48,9 +50,11 @@ ocr review --audience agent --background "business context here" [user-args]
 **Argument handling:**
 
 - **Background context** (RECOMMENDED): use `--background "context"` or `-b "context"` to provide business context for better review quality
-- **Default** (no user arguments): reviews staged, unstaged, and untracked changes (workspace mode)
-- **Specific commit**: use `--commit` or `-c` to review a single commit against its parent
-- **Branch comparison**: use `--from <ref>` and `--to <ref>` to review diff between two refs
+- **Default** (no user arguments): reviews Git staged/unstaged/untracked changes or SVN versioned/unversioned changes (workspace mode)
+- **Specific commit**: use `--commit` or `-c` to review a single Git commit or SVN revision against its parent
+- **Branch comparison**: use `--from <ref>` and `--to <ref>` to review diff between two Git refs
+- **SVN revision range**: use `--from <revision>` and `--to <revision>` for exact SVN endpoints (no Git merge base); numbers, `HEAD`, and `{date}` are accepted and frozen once
+- **Remote SVN path range**: add both `--svn-from-target <url[@peg]>` and `--svn-to-target <url[@peg]>`; a working copy is optional for absolute URLs
 - **Timeout**: effective timeout per review group = `--timeout` × review rounds. Default `--timeout 15` with default effort `medium` (2 rounds) gives 30 minutes; `low`/`high` give 15/45 minutes.
 - **Concurrency**: default concurrency is 8 file workers; reduce with `--concurrency <n>` if rate limits are hit
 - **Preview mode**: use `--preview` or `-p` to preview which files will be reviewed without running the LLM
@@ -64,6 +68,9 @@ ocr review --audience agent --background "business context here" [user-args]
 | "review my changes" / "review the working copy" | `ocr review --audience agent -b "context"` |
 | "review this PR" / "review feature branch" | `ocr review --audience agent -b "context" --from main --to <branch>` |
 | "review commit abc123" | `ocr review --audience agent -b "context" --commit abc123` |
+| "review SVN revision 128" | `ocr review --audience agent -b "context" --commit 128` |
+| "review SVN revisions 120 to 128" | `ocr review --audience agent -b "context" --from 120 --to 128` |
+| "compare remote SVN paths" | `ocr review --audience agent -b "context" --from 120 --to 128 --svn-from-target <old-url@peg> --svn-to-target <new-url@peg>` |
 | "what would be reviewed?" (dry-run) | `ocr review --preview` |
 
 **Output mode:**
@@ -200,8 +207,10 @@ Beyond the common flags above, `ocr review` exposes a few groups of controls. Ru
 ## Gotchas
 
 - **LLM must be configured first** — `ocr review` will fail loudly if no LLM is reachable. See the Troubleshooting section below if this happens.
-- **Working directory matters** — `ocr review` operates on the Git repo at the current directory. Use `--repo /path/to/repo` to run from elsewhere.
-- **Untracked files are reviewed in workspace mode** — running bare `ocr review` includes staged, unstaged, *and* untracked changes. Stage selectively if you want narrower scope.
+- **Working directory matters** — `ocr review` operates on the Git repository or SVN working copy at the current directory. Use `--repo /path/to/repo` to run from elsewhere.
+- **Untracked files are reviewed in workspace mode** — running bare `ocr review` includes Git staged/unstaged/untracked changes or SVN versioned/unversioned changes. Stage selectively if you want narrower scope.
+- **SVN immutable modes are exact** — `--commit` means revision minus one to revision, while `--from/--to` compares the two frozen numeric endpoints without Git merge-base semantics. `BASE`, `COMMITTED`, and `PREV` are rejected because they depend on working-copy state.
+- **Keep SVN credentials out of targets** — configure authentication and certificate trust in the SVN client. OCR rejects URLs containing username/password userinfo and does not persist remote target URLs in manifests, sessions, or delegate JSON.
 - **Large diffs may hit token limits** — `MAX_TOKENS` sets the prompt budget (`200000` in the review template; `ocr scan` uses `58888`); conversation context is compressed to stay within this prompt budget. Model output is capped separately by `MAX_COMPLETION_TOKENS` (`16384`). A file whose diff alone exceeds ~80% of `MAX_TOKENS` is skipped before the LLM is called.
 - **Plan phase triggers on either of two thresholds** — a group runs an extra risk-analysis phase before main review when its largest changed file reaches `PLAN_MODE_LINE_THRESHOLD` (default `50`) **or** it holds 2+ files whose combined changed lines reach `PLAN_MODE_GROUP_LINE_THRESHOLD` (default `100`). This adds latency but improves quality.
 - **Don't pass `--audience human`** — it streams progress UI that pollutes output. Always use `--audience agent`.
@@ -253,6 +262,10 @@ ocr config set llm.use_anthropic true
 ```
 
 Verify connectivity with `ocr llm test`. Stop here and ask the user to provide credentials — never invent or hardcode API keys.
+
+**SVN workflows report that `svn` is missing or unsupported**
+
+Install an Apache Subversion command-line client, verify `svn --version --quiet`, and use version 1.7 or newer. Authentication and certificate trust must already work non-interactively for the target repository.
 
 ## References
 

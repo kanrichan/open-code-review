@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alibaba/open-code-review/internal/vcs"
 )
 
 func initTestGitRepo(t *testing.T) string {
@@ -105,11 +107,11 @@ func TestResolveRepoDir_ValidGitRepo(t *testing.T) {
 	}
 }
 
-func TestResolveRepoDir_NotGitRepo(t *testing.T) {
+func TestResolveRepoDir_UnsupportedDirectory(t *testing.T) {
 	dir := t.TempDir()
 	_, err := resolveRepoDir(dir)
 	if err == nil {
-		t.Fatal("expected error for non-git dir")
+		t.Fatal("expected error for unsupported directory")
 	}
 	if !strings.Contains(err.Error(), "not a git repository") {
 		t.Errorf("unexpected error: %v", err)
@@ -176,6 +178,37 @@ func TestValidateReviewRefs_EmptySkipped(t *testing.T) {
 	err := validateReviewRefs(dir, reviewOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateRepositoryReviewMode_SubversionRevisions(t *testing.T) {
+	if err := validateRepositoryReviewMode(vcs.Subversion, reviewOptions{}); err != nil {
+		t.Fatalf("workspace review rejected: %v", err)
+	}
+	for _, opts := range []reviewOptions{
+		{commit: "42"},
+		{from: "41", to: "42"},
+		{commit: "HEAD"},
+		{from: "{2026-01-01}", to: "HEAD"},
+		{from: "41", to: "42", svnFromTarget: "https://svn.example.com/repo/trunk@41", svnToTarget: "https://svn.example.com/repo/branches/feature@42"},
+	} {
+		if err := validateRepositoryReviewMode(vcs.Subversion, opts); err != nil {
+			t.Errorf("options %+v were rejected for Subversion: %v", opts, err)
+		}
+	}
+	for _, opts := range []reviewOptions{
+		{commit: "-42"},
+		{commit: "BASE"},
+		{from: "41:42", to: "43"},
+		{from: "41", to: "42", svnFromTarget: "https://alice:secret@svn.example.com/repo/trunk@41", svnToTarget: "https://svn.example.com/repo/trunk@42"},
+		{from: "41", to: "42", svnFromTarget: "https://svn.example.com/repo/trunk?token=secret@41", svnToTarget: "https://svn.example.com/repo/trunk@42"},
+	} {
+		if err := validateRepositoryReviewMode(vcs.Subversion, opts); err == nil {
+			t.Errorf("unsafe options %+v were accepted for Subversion", opts)
+		}
+	}
+	if err := validateRepositoryReviewMode(vcs.Git, reviewOptions{commit: "HEAD"}); err != nil {
+		t.Fatalf("Git commit review rejected: %v", err)
 	}
 }
 

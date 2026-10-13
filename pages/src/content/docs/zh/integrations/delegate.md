@@ -58,8 +58,9 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 
 输出内容：
 
+- **vcs** — git / svn
 - **mode** — workspace / range / commit
-- **ref 元数据** — from、to、commit、merge\_base
+- **ref 元数据** — from、to、commit、merge\_base，以及安全的已解析 SVN operative/peg revision
 - **可审查文件列表** — 路径、状态、插入/删除行数
 - **已排除文件** — 及排除原因
 
@@ -69,6 +70,7 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 |------|------|
 | 工作区变更 | `ocr delegate preview` |
 | 分支对比 | `ocr delegate preview --from main --to feature` |
+| 远端 SVN 路径 | `ocr delegate preview --from 120 --to 128 --svn-from-target <old-url@peg> --svn-to-target <new-url@peg>` |
 | 单次提交 | `ocr delegate preview -c abc123` |
 
 ### 第 2 步：获取文件规则
@@ -81,7 +83,7 @@ ocr delegate rule <path1> <path2> ...
 
 ### 第 3 步：获取 diff
 
-根据第 1 步的模式和引用信息选择 diff 命令。审查中的所有 Git 调用均使用 `git --no-pager`。
+根据第 1 步的 VCS、模式和引用信息选择 diff 命令。审查中的所有 Git 调用均使用 `git --no-pager`。
 
 以下 diff 命令关闭外部 diff 程序、文本转换和颜色输出，以获取纯文本补丁。
 
@@ -95,10 +97,46 @@ git --no-pager diff --no-ext-diff --no-textconv --no-color <merge_base>..<to> --
 git --no-pager show --no-ext-diff --no-textconv --no-color <commit> -- "<path>"
 ```
 
+对于 SVN Range 或 Commit 模式，先运行
+`svn info --xml --non-interactive --depth empty -- .` 并读取 `<url>` 值。
+该 XML 形式兼容项目支持的整个 SVN 1.7+ 范围。然后使用 preview 返回的数字
+`resolved_base` 与 `resolved_head`：
+
+```bash
+svn diff --git --internal-diff --show-copies-as-adds --old <working-copy-url>@<resolved_base> --new <working-copy-url>@<resolved_head>
+svn cat --revision <resolved_head> -- <working-copy-url>/<url-escaped-path>@<resolved_head>
+```
+
+明确的 URL peg 可确保 diff 与目标内容不受脏、过期或混合 revision 工作副本影响。
+
+显式比较仓库路径时，请给 preview 传入 `--svn-from-target` 和 `--svn-to-target`。JSON
+有意不回显 URL；host agent 应在运行时输入中保留它们，将各 URL 与可选的 peg
+后缀分开，并把 URL 部分与安全的数字字段 `resolved_base`、`resolved_head`、
+`resolved_base_peg`、`resolved_head_peg` 组合使用：
+
+```bash
+ocr delegate preview --format json \
+  --from 120 --to 128 \
+  --svn-from-target 'https://svn.example.com/repos/app/trunk@120' \
+  --svn-to-target 'https://svn.example.com/repos/app/branches/feature@128'
+
+svn info --xml --non-interactive --revision <resolved_base> -- <source-target-url>@<resolved_base_peg>
+svn info --xml --non-interactive --revision <resolved_head> -- <destination-target-url>@<resolved_head_peg>
+
+svn diff --non-interactive --git --internal-diff --show-copies-as-adds \
+  --notice-ancestry \
+  --old <source-url-from-info>@<resolved_base> \
+  --new <destination-url-from-info>@<resolved_head>
+```
+
+这会比较精确 SVN 端点，不使用 Git merge-base 语义。先解析历史 URL 可保留路径移动语义；
+目标内容读取使用 `svn info` 在 `resolved_head` 返回的 destination URL。
+
 **Workspace 模式**：
 ```bash
-git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # 已跟踪文件
-cat "<path>"                     # 新的未跟踪文件
+git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # Git 已跟踪文件
+svn diff --git --internal-diff --show-copies-as-adds -- <path>                     # SVN 已纳管文件
+cat "<path>"                     # Git 未跟踪 / SVN 未纳管文件
 ```
 
 查询上下文：
@@ -139,7 +177,7 @@ Git 以退出码 0 结束后，分块读取并审查整个文件，再删除临�
 
 | 命令 | 用途 |
 |------|------|
-| `ocr delegate preview` | 列出可审查文件 + mode/ref 元数据 |
+| `ocr delegate preview` | 列出可审查文件 + VCS/mode/ref 元数据 |
 | `ocr delegate rule <path...>` | 按内容分组解析审查规则 |
 
 ## 通用标志
@@ -148,6 +186,8 @@ Git 以退出码 0 结束后，分块读取并审查整个文件，再删除临�
 |------|------|
 | `--from <ref>` | Range 模式的源引用 |
 | `--to <ref>` | Range 模式的目标引用 |
+| `--svn-from-target <url[@peg]>` | 精确远端范围的源 SVN 目录 |
+| `--svn-to-target <url[@peg]>` | 精确远端范围的目标 SVN 目录 |
 | `-c, --commit <hash>` | 单次提交模式 |
 | `--repo <path>` | 仓库根目录（默认：cwd） |
 | `--rule <path>` | 自定义 rule.json 路径 |

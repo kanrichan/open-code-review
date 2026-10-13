@@ -13,8 +13,8 @@ sidebar:
 flowchart TD
     A["<b>ocr review</b>"]
     B["<b>bootstrap</b><br/><span style='font-size:0.85em'>Resolve LLM endpoint (config → env → rc files)<br/>Load template, tool registry, system rules</span>"]
-    C["<b>diff provider</b><br/><span style='font-size:0.85em'>git diff / ls-files / show — produce []model.Diff<br/>Modes: Workspace · Commit · Range</span>"]
-    D["<b>filter & rules</b><br/><span style='font-size:0.85em'>5-gate filter (selection.go) — drop binaries,<br/>excluded paths, unsupported extensions. Pick rule per file.</span>"]
+    C["<b>diff provider</b><br/><span style='font-size:0.85em'>Git: diff / ls-files / show · SVN: diff / status / cat<br/>produce []model.Diff · Modes: Workspace · Commit · Range</span>"]
+    D["<b>filter & rules</b><br/><span style='font-size:0.85em'>5-gate filter (selection.go / preview.go) — drop binaries,<br/>excluded paths, unsupported extensions. Pick rule per file.</span>"]
     D2["<b>semantic grouping</b><br/><span style='font-size:0.85em'>One LLM call over file metadata — bundle related<br/>files into groups (max 10 files each)</span>"]
     E["<b>subtask dispatch</b><br/><span style='font-size:0.85em'>For every group in parallel (concurrency=N):<br/>Plan phase (optional) → Main loop × rounds → Comments</span>"]
     F["<b>output writer</b><br/><span style='font-size:0.85em'>Synchronous line-resolution & review-filter; renders text<br/>or JSON depending on --format / --audience.</span>"]
@@ -39,8 +39,14 @@ flowchart TD
 | 模式 | 触发方式 | 返回内容 |
 |---|---|---|
 | `Workspace` | 无参数 | staged + unstaged + untracked 变更 |
-| `Commit` | `--commit <sha>` / `-c <sha>` | `<sha>` 引入的变更（经 `git show <sha>`，等价于 `<sha>^..<sha>` diff） |
-| `Range` | `--from <a> --to <b>` | `merge-base(a, b)..b` |
+| `Commit` | `--commit <ref>` / `-c <ref>` | Git：`<ref>` 引入的变更；SVN：准确的 `REV-1:REV` 变更 |
+| `Range` | `--from <a> --to <b>` | Git：`merge-base(a, b)..b`；SVN：准确的数字 revision 端点 |
+
+`internal/diff/svn.go` 为 Subversion 1.7+ 提供三种模式。OCR 自动检测工作副本类型，
+将 `svn diff --git` 转换为工作副本内的本地路径，并在工作区模式下合并
+`svn status --xml` 中的未纳管文件。commit 与范围输入会先解析成数字 revision；
+provider 随后使用明确的 old/new URL peg 与 `svn cat`，因此目标内容不会随工作副本或
+仓库 `HEAD` 漂移。
 
 每个 diff 携带：old/new path、old/new hunk、插入/删除计数、二进制标志、重命名
 检测。`DiffContextLines` 固定为 **3**——与 Git 默认一致。

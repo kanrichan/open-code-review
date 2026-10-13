@@ -43,10 +43,21 @@ URL 格式——确保 `llm.use_anthropic` 与你指向的 URL 相匹配：
 - OpenAI / OpenAI 兼容：URL 以 `/v1/chat/completions` 结尾，
   `use_anthropic=false`。
 
-### `not a git repository`
+### `not a git repository or Subversion working copy`
 
-`ocr review` 对当前目录运行 `git diff`（以及对 untracked 文件的 `git ls-files`）。
-若你不在 Git 工作树内，它会提前退出。要么 `cd` 进仓库，要么传 `--repo /path/to/repo`。
+`ocr review` 会自动检测 Git 工作树或 Subversion 工作副本。若当前目录两者都不是，
+它会提前退出。请进入受支持的工作副本，或传 `--repo /path/to/repo`。
+
+### `svn` 缺失、版本过旧或认证失败
+
+SVN 评审需要 1.7 或更新版本的命令行客户端。先运行 `svn --version --quiet`；若命令
+不存在，请参考[各平台安装步骤](../installation/)。
+
+OCR 使用 `--non-interactive`，无法回答密码或证书提示。请先用运行 OCR 的同一系统账号
+执行一次 `svn info <repository-url>`，建立正常的 SVN 认证缓存并信任证书，再确认
+`svn info --non-interactive <repository-url>` 成功。不要把凭据嵌入 URL。Revision 可使用
+数字、`HEAD` 或 `{date}`；`BASE`、`COMMITTED` 和 `PREV` 依赖可变的工作副本状态，
+因此会被有意拒绝。
 
 ### "No tool calls parsed"（本地模型 / Ollama）
 
@@ -320,8 +331,11 @@ OCR 把你的 **diff**（及可选 read-tool 片段）发到你配置的 LLM 端
 
 ### OCR 支持非 Git VCS 吗？
 
-不支持。diff provider 通过 shell 调用 `git`。SVN / Mercurial 等需要新的 provider；Hg 支持的
-issue 已在[此](https://github.com/alibaba/open-code-review/issues)开放。
+支持。使用 Subversion 1.7 或更新版本时，OCR 可评审已纳管和未纳管的工作副本变更，
+也可通过 `--commit REV` 评审单个不可变 revision，或通过 `--from REV --to REV`
+评审精确 revision 范围。`HEAD` 与日期 revision 会先冻结为数字端点。跨路径精确比较使用
+成对的 `--svn-from-target` 与 `--svn-to-target`；绝对 URL 不需要工作副本，仓库相对的
+`^/` 目标则需要。Mercurial 等其他 VCS 暂无 provider。
 
 ### 为什么二进制叫 `opencodereview` 而 CLI 是 `ocr`？
 

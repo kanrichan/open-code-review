@@ -1,0 +1,642 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 alibaba/open-code-review Contributors
+
+package diff
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"unicode"
+
+	"github.com/alibaba/open-code-review/internal/model"
+	"github.com/alibaba/open-code-review/internal/pathutil"
+	"github.com/alibaba/open-code-review/internal/svncmd"
+)
+
+type svnReviewMode uint8
+
+const (
+	svnModeWorkspace svnReviewMode = iota
+	svnModeRange
+	svnModeCommit
+)
+
+// SVNProvider retrieves workspace or immutable repository changes for the URL
+// selected by a Subversion working copy.
+type SVNProvider struct {
+	repoDir         string
+	mode            svnReviewMode
+	from            string
+	to              string
+	commit          string
+	fromTarget      string
+	toTarget        string
+	input           InputResolution
+	inputResolved   bool
+	run             func(context.Context, ...string) (string, error)
+	info            func(context.Context) (svncmd.WorkingCopyInfo, error)
+	resolveRevision func(context.Context, string, string) (string, error)
+	resolveTargets  func(context.Context, string, string, string, string) (svncmd.ResolvedTargetPair, error)
+}
+
+// NewSVNWorkspaceProvider creates a provider for local Subversion changes.
+func NewSVNWorkspaceProvider(repoDir string) *SVNProvider {
+	return newSVNProvider(repoDir, svnModeWorkspace, "", "", "")
+}
+
+// NewSVNRangeProvider creates a provider comparing two SVN revisions.
+func NewSVNRangeProvider(repoDir, from, to string) *SVNProvider {
+	return newSVNProvider(repoDir, svnModeRange, from, to, "")
+}
+
+// NewSVNTargetRangeProvider creates a provider comparing two explicit remote
+// SVN directory targets at exact operative and peg revisions.
+func NewSVNTargetRangeProvider(repoDir, from, to, fromTarget, toTarget string) *SVNProvider {
+	p := newSVNProvider(repoDir, svnModeRange, from, to, "")
+	p.fromTarget = fromTarget
+	p.toTarget = toTarget
+	return p
+}
+
+// NewSVNCommitProvider creates a provider for the change introduced by one SVN
+// revision.
+func NewSVNCommitProvider(repoDir, revision string) *SVNProvider {
+	return newSVNProvider(repoDir, svnModeCommit, "", "", revision)
+}
+
+func newSVNProvider(repoDir string, mode svnReviewMode, from, to, commit string) *SVNProvider {
+	p := &SVNProvider{repoDir: repoDir, mode: mode, from: from, to: to, commit: commit}
+	p.run = p.runSVN
+	p.info = func(ctx context.Context) (svncmd.WorkingCopyInfo, error) {
+		return svncmd.Info(ctx, repoDir)
+	}
+	p.resolveRevision = func(ctx context.Context, repositoryRoot, raw string) (string, error) {
+		return svncmd.ResolveRevision(ctx, repoDir, repositoryRoot, raw)
+	}
+	p.resolveTargets = func(ctx context.Context, from, to, fromTarget, toTarget string) (svncmd.ResolvedTargetPair, error) {
+		return svncmd.ResolveTargetPair(ctx, repoDir, from, to, fromTarget, toTarget)
+	}
+	return p
+}
+
+// ResolveSVNInput freezes user-provided SVN revision spellings to numeric
+// repository endpoints and captures the selected repository URL for immutable
+// file reads.
+func ResolveSVNInput(ctx context.Context, repoDir, from, to, commit string) (InputResolution, error) {
+	return ResolveSVNInputWithTargets(ctx, repoDir, from, to, commit, "", "")
+}
+
+// ResolveSVNInputWithTargets freezes either a working-copy-selected immutable
+// SVN input or an explicit source/destination target pair.
+func ResolveSVNInputWithTargets(ctx context.Context, repoDir, from, to, commit, fromTarget, toTarget string) (InputResolution, error) {
+	var provider *SVNProvider
+	switch {
+	case fromTarget != "" || toTarget != "":
+		if commit != "" || from == "" || to == "" || fromTarget == "" || toTarget == "" {
+			return InputResolution{}, fmt.Errorf("explicit Subversion targets require --from, --to, --svn-from-target, and --svn-to-target")
+		}
+		provider = NewSVNTargetRangeProvider(repoDir, from, to, fromTarget, toTarget)
+	case commit != "":
+		provider = NewSVNCommitProvider(repoDir, commit)
+	case from != "" && to != "":
+		provider = NewSVNRangeProvider(repoDir, from, to)
+	default:
+		return InputResolution{}, fmt.Errorf("Subversion input resolution requires --commit or --from/--to")
+	}
+	if err := provider.ensureInputResolved(ctx); err != nil {
+		return InputResolution{}, err
+	}
+	return provider.input, nil
+}
+
+// SealInput makes the provider reuse endpoints resolved by pre-flight admission
+// instead of resolving moving inputs such as HEAD again.
+func (p *SVNProvider) SealInput(input InputResolution) {
+	p.input = input
+	p.inputResolved = true
+}
+
+// GetDiff returns workspace or immutable revision changes.
+func (p *SVNProvider) GetDiff(ctx context.Context) ([]model.Diff, error) {
+	if p.mode != svnModeWorkspace {
+		return p.getImmutableDiff(ctx)
+	}
+	return p.getWorkspaceDiff(ctx)
+}
+
+func (p *SVNProvider) getWorkspaceDiff(ctx context.Context) ([]model.Diff, error) {
+	inspection, err := p.inspectWorkingCopy(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tracked, err := p.run(ctx, "diff", "--git", "--internal-diff", "--show-copies-as-adds", "--depth", "infinity", "--", ".")
+	if err != nil {
+		return nil, fmt.Errorf("svn diff failed: %w", err)
+	}
+
+	unversioned, err := p.unversionedFiles(ctx, inspection.status)
+	if err != nil {
+		return nil, fmt.Errorf("list unversioned Subversion files: %w", err)
+	}
+
+	var combined strings.Builder
+	normalizedTracked, err := normalizeSVNDiffWithCandidates(p.repoDir, tracked, svnDiffCandidatePaths(p.repoDir, inspection.status))
+	if err != nil {
+		return nil, err
+	}
+	combined.WriteString(svnContentDiffSections(normalizedTracked))
+	for _, section := range workspaceFileDiffs(p.repoDir, unversioned) {
+		combined.WriteString(section)
+		combined.WriteByte('\n')
+	}
+
+	diffs, err := ParseDiffText(ctx, combined.String(), p.repoDir, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	diffs = removeSVNPropertyOnlyDiffs(diffs)
+	if err := annotateSVNHistory(p.repoDir, diffs, inspection); err != nil {
+		return nil, err
+	}
+	return (&Provider{repoDir: p.repoDir}).filterDiffs(diffs), nil
+}
+
+func (p *SVNProvider) getImmutableDiff(ctx context.Context) ([]model.Diff, error) {
+	if err := p.ensureInputResolved(ctx); err != nil {
+		return nil, err
+	}
+	if p.input.ResolvedHead == "" || p.input.RepositoryTarget == "" {
+		return nil, fmt.Errorf("sealed Subversion input is missing its destination revision or repository target")
+	}
+	if p.mode == svnModeRange && p.input.ResolvedBase == "" {
+		return nil, fmt.Errorf("sealed Subversion range input is missing its source revision")
+	}
+	if p.mode == svnModeCommit && p.input.ResolvedBase == "" {
+		// Revision zero is the empty repository and has no preceding change.
+		return []model.Diff{}, nil
+	}
+
+	sourceTarget := p.input.RepositorySourceTarget
+	if sourceTarget == "" {
+		sourceTarget = p.input.RepositoryTarget
+	}
+	oldTarget := svncmd.PegTarget(sourceTarget, p.input.ResolvedBase)
+	newTarget := svncmd.PegTarget(p.input.RepositoryTarget, p.input.ResolvedHead)
+	diffArgs := []string{"diff", "--non-interactive", "--git", "--internal-diff", "--show-copies-as-adds", "--depth", "infinity"}
+	if p.input.RepositorySourceTarget != "" {
+		diffArgs = append(diffArgs, "--notice-ancestry")
+	}
+	diffArgs = append(diffArgs, "--old", oldTarget, "--new", newTarget)
+	tracked, err := p.run(ctx, diffArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("svn revision diff failed (Subversion 1.7 or newer is required): %w", err)
+	}
+
+	normalized := svnContentDiffSections(normalizeSVNDiff(p.repoDir, tracked))
+	readContent := func(ctx context.Context, path string) ([]byte, error) {
+		target, err := svncmd.ChildTarget(p.input.RepositoryTarget, path, p.input.ResolvedHead)
+		if err != nil {
+			return nil, err
+		}
+		out, err := p.run(ctx, "cat", "--non-interactive", "--revision", p.input.ResolvedHead, "--", target)
+		return []byte(out), err
+	}
+	diffs, err := parseDiffTextWithReader(ctx, normalized, readContent)
+	if err != nil {
+		return nil, err
+	}
+	diffs = removeSVNPropertyOnlyDiffs(diffs)
+	return (&Provider{repoDir: p.repoDir}).filterDiffs(diffs), nil
+}
+
+func (p *SVNProvider) ensureInputResolved(ctx context.Context) error {
+	if p.mode == svnModeWorkspace || p.inputResolved {
+		return nil
+	}
+	switch p.mode {
+	case svnModeRange:
+		if err := svncmd.ValidateRevision(p.from); err != nil {
+			return fmt.Errorf("validate --from: %w", err)
+		}
+		if err := svncmd.ValidateRevision(p.to); err != nil {
+			return fmt.Errorf("validate --to: %w", err)
+		}
+	case svnModeCommit:
+		if err := svncmd.ValidateRevision(p.commit); err != nil {
+			return fmt.Errorf("validate --commit: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown Subversion review mode")
+	}
+	if p.mode == svnModeRange && (p.fromTarget != "" || p.toTarget != "") {
+		if p.fromTarget == "" || p.toTarget == "" {
+			return fmt.Errorf("explicit Subversion targets must be supplied as a pair")
+		}
+		pair, err := p.resolveTargets(ctx, p.from, p.to, p.fromTarget, p.toTarget)
+		if err != nil {
+			return err
+		}
+		p.input.ResolvedBase = pair.Source.OperativeRevision
+		p.input.ResolvedHead = pair.Destination.OperativeRevision
+		p.input.ExactRange = pair.Source.OperativeRevision + ":" + pair.Destination.OperativeRevision
+		p.input.RepositorySourceTarget = pair.Source.URL
+		p.input.RepositoryTarget = pair.Destination.URL
+		p.input.RepositoryRoot = pair.Source.RepositoryRoot
+		p.input.RepositoryUUID = pair.Source.RepositoryUUID
+		p.input.SourcePegRevision = pair.Source.PegRevision
+		p.input.TargetPegRevision = pair.Destination.PegRevision
+		p.inputResolved = true
+		return nil
+	}
+	info, err := p.info(ctx)
+	if err != nil {
+		return fmt.Errorf("read Subversion working-copy metadata: %w", err)
+	}
+	if info.URL == "" || info.RepositoryRoot == "" {
+		return fmt.Errorf("Subversion working-copy metadata did not report repository URLs")
+	}
+
+	p.input.RepositoryTarget = info.URL
+	p.input.RepositoryRoot = info.RepositoryRoot
+	p.input.RepositoryUUID = info.RepositoryUUID
+	resolvedRevisions := make(map[string]string)
+	resolve := func(raw string) (string, error) {
+		key := raw
+		if strings.EqualFold(raw, "HEAD") {
+			key = "HEAD"
+		}
+		if revision, ok := resolvedRevisions[key]; ok {
+			return revision, nil
+		}
+		revision, err := p.resolveRevision(ctx, info.RepositoryRoot, raw)
+		if err == nil {
+			resolvedRevisions[key] = revision
+		}
+		return revision, err
+	}
+	switch p.mode {
+	case svnModeRange:
+		base, err := resolve(p.from)
+		if err != nil {
+			return fmt.Errorf("resolve --from: %w", err)
+		}
+		head, err := resolve(p.to)
+		if err != nil {
+			return fmt.Errorf("resolve --to: %w", err)
+		}
+		p.input.ResolvedBase = base
+		p.input.ResolvedHead = head
+		p.input.ExactRange = base + ":" + head
+		p.input.SourcePegRevision = base
+		p.input.TargetPegRevision = head
+	case svnModeCommit:
+		head, err := resolve(p.commit)
+		if err != nil {
+			return fmt.Errorf("resolve --commit: %w", err)
+		}
+		base, err := svncmd.PreviousRevision(head)
+		if err != nil {
+			return err
+		}
+		p.input.ResolvedBase = base
+		p.input.ResolvedHead = head
+		p.input.SourcePegRevision = base
+		p.input.TargetPegRevision = head
+		if base != "" {
+			p.input.ExactRange = base + ":" + head
+		}
+	}
+	p.inputResolved = true
+	return nil
+}
+
+// ResolveInput returns the numeric SVN endpoints used by GetDiff. Resolution
+// errors are surfaced by GetDiff; callers invoke this after a successful load.
+func (p *SVNProvider) ResolveInput(ctx context.Context) InputResolution {
+	_ = p.ensureInputResolved(ctx)
+	return p.input
+}
+
+// RemoteIdentity returns a stable, credential-free repository identity. SVN's
+// repository UUID survives URL moves and also identifies local file repositories;
+// older servers that omit it fall back to a canonical credential-free URL.
+func (p *SVNProvider) RemoteIdentity(ctx context.Context) string {
+	identity := ""
+	if uuid := strings.TrimSpace(p.input.RepositoryUUID); uuid != "" {
+		identity = "svn:" + strings.ToLower(uuid)
+	} else if p.input.RepositoryRoot != "" {
+		identity = canonicalRemote(p.input.RepositoryRoot)
+	} else {
+		info, err := p.info(ctx)
+		if err != nil {
+			return ""
+		}
+		if uuid := strings.TrimSpace(info.RepositoryUUID); uuid != "" {
+			identity = "svn:" + strings.ToLower(uuid)
+		} else {
+			remote := info.RepositoryRoot
+			if remote == "" {
+				remote = info.URL
+			}
+			identity = canonicalRemote(remote)
+		}
+	}
+	return identity
+}
+
+func (p *SVNProvider) runSVN(ctx context.Context, args ...string) (string, error) {
+	out, err := svncmd.Output(ctx, p.repoDir, args...)
+	return string(out), err
+}
+
+// normalizeSVNDiff converts Subversion's repository-root-relative Git headers
+// to working-copy-relative paths. `svn diff --git` always prefixes each file
+// section with `Index:`, whose path is relative to the command target and is
+// therefore the authoritative path for local file reads.
+func normalizeSVNDiff(repoDir, raw string) string {
+	normalized, _ := normalizeSVNDiffWithCandidates(repoDir, raw, nil)
+	return normalized
+}
+
+func normalizeSVNDiffWithCandidates(repoDir, raw string, candidates []string) (string, error) {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	lines := strings.Split(raw, "\n")
+	var out strings.Builder
+	var indexPath string
+	inHunk := false
+	skipSection := true
+
+	for _, line := range lines {
+		if path, ok := strings.CutPrefix(line, "Index: "); ok {
+			var err error
+			indexPath, err = resolveSVNDiffPath(repoDir, path, candidates)
+			if err != nil {
+				return "", err
+			}
+			inHunk = false
+			skipSection = indexPath == ""
+			continue
+		}
+		if skipSection {
+			continue
+		}
+		if strings.Trim(line, "=") == "" && strings.Contains(line, "=") {
+			continue
+		}
+		if strings.HasPrefix(line, "diff --git ") && indexPath != "" {
+			line = fmt.Sprintf("diff --git a/%s b/%s", indexPath, indexPath)
+			inHunk = false
+		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+		}
+		if indexPath != "" && !inHunk {
+			switch {
+			case strings.HasPrefix(line, "--- ") && !strings.HasPrefix(line, "--- /dev/null"):
+				line = "--- a/" + indexPath
+			case strings.HasPrefix(line, "+++ ") && !strings.HasPrefix(line, "+++ /dev/null"):
+				line = "+++ b/" + indexPath
+			}
+		}
+		out.WriteString(line)
+		out.WriteByte('\n')
+	}
+	return out.String(), nil
+}
+
+func svnDiffCandidatePaths(repoDir string, status []svncmd.StatusEntry) []string {
+	seen := make(map[string]struct{})
+	for _, entry := range status {
+		if entry.Item == "unversioned" || entry.Item == "ignored" || entry.Item == "external" {
+			continue
+		}
+		if entry.Item == "normal" && entry.Properties != "modified" && !entry.Copied {
+			continue
+		}
+		path := normalizeSVNPath(repoDir, entry.Path)
+		if path != "" {
+			seen[path] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(seen))
+	for path := range seen {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func resolveSVNDiffPath(repoDir, raw string, candidates []string) (string, error) {
+	path := normalizeSVNPath(repoDir, raw)
+	if path == "" || len(candidates) == 0 {
+		return path, nil
+	}
+	for _, candidate := range candidates {
+		if path == candidate {
+			return candidate, nil
+		}
+	}
+	shape := svnPathASCIIShape(path)
+	var match string
+	for _, candidate := range candidates {
+		if shape != svnPathASCIIShape(candidate) {
+			continue
+		}
+		if match != "" {
+			return "", fmt.Errorf("Subversion diff path %q is ambiguous between %q and %q after console encoding; configure the client for UTF-8 output", raw, match, candidate)
+		}
+		match = candidate
+	}
+	if match != "" {
+		return match, nil
+	}
+	if shape != path {
+		return "", fmt.Errorf("Subversion diff path %q could not be reconciled with UTF-8 paths from svn status --xml", raw)
+	}
+	return path, nil
+}
+
+func svnPathASCIIShape(path string) string {
+	var shape strings.Builder
+	inNonASCII := false
+	for _, r := range path {
+		if r > unicode.MaxASCII || r == '?' {
+			if !inNonASCII {
+				shape.WriteByte('?')
+				inNonASCII = true
+			}
+			continue
+		}
+		inNonASCII = false
+		shape.WriteRune(r)
+	}
+	return shape.String()
+}
+
+func normalizeSVNPath(repoDir, raw string) string {
+	if raw == "" || strings.ContainsAny(raw, "\x00\r\n") {
+		return ""
+	}
+	path := filepath.FromSlash(raw)
+	if filepath.IsAbs(path) {
+		rel, err := filepath.Rel(repoDir, path)
+		if err != nil {
+			return ""
+		}
+		path = rel
+	}
+	path = filepath.Clean(path)
+	if path == "." {
+		return path
+	}
+	if path == ".." || strings.HasPrefix(path, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(path)
+}
+
+// svnContentDiffSections drops property-only sections before parsing them.
+// They have no line-addressable source change for the review agent, and trying
+// to finalize a directory section would otherwise produce a misleading file
+// read warning.
+func svnContentDiffSections(raw string) string {
+	lines := strings.Split(raw, "\n")
+	var out strings.Builder
+	var section []string
+	meaningful := false
+	inProperties := false
+
+	flush := func() {
+		if meaningful {
+			out.WriteString(strings.Join(section, "\n"))
+			out.WriteByte('\n')
+		}
+		section = nil
+		meaningful = false
+		inProperties = false
+	}
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
+			section = []string{line}
+			continue
+		}
+		if section == nil {
+			continue
+		}
+		if strings.HasPrefix(line, "Property changes on: ") {
+			inProperties = true
+			continue
+		}
+		if inProperties {
+			continue
+		}
+		section = append(section, line)
+		if strings.HasPrefix(line, "@@") ||
+			strings.HasPrefix(line, "new file mode ") ||
+			strings.HasPrefix(line, "deleted file mode ") ||
+			binaryRe.MatchString(line) || line == "GIT binary patch" ||
+			strings.HasPrefix(line, "Cannot display: file marked as a binary type") {
+			meaningful = true
+		}
+	}
+	flush()
+	return out.String()
+}
+
+func (p *SVNProvider) unversionedFiles(ctx context.Context, status []svncmd.StatusEntry) ([]string, error) {
+	patterns := LoadGitignorePatterns(p.repoDir)
+	seen := make(map[string]struct{})
+	for _, entry := range status {
+		if entry.Item != "unversioned" {
+			continue
+		}
+		rel := normalizeSVNPath(p.repoDir, entry.Path)
+		if rel == "" || rel == "." || IsPathExcluded(p.repoDir, rel, patterns) {
+			continue
+		}
+		if err := collectUnversionedPath(ctx, p.repoDir, rel, patterns, seen); err != nil {
+			return nil, err
+		}
+	}
+
+	files := make([]string, 0, len(seen))
+	for path := range seen {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func collectUnversionedPath(ctx context.Context, repoDir, rel string, patterns []string, seen map[string]struct{}) error {
+	fullPath := filepath.Join(repoDir, filepath.FromSlash(rel))
+	if !pathutil.WithinBase(repoDir, fullPath) {
+		return fmt.Errorf("Subversion status path %q is outside working copy", rel)
+	}
+	info, err := os.Lstat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		seen[rel] = struct{}{}
+		return nil
+	}
+	if nestedInfo, nestedErr := os.Stat(filepath.Join(fullPath, ".svn")); nestedErr == nil && nestedInfo.IsDir() {
+		return fmt.Errorf("unversioned path %q contains a nested Subversion working copy; review it separately", rel)
+	}
+
+	return filepath.WalkDir(fullPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return nil
+		}
+		if entry.IsDir() && entry.Name() == ".svn" {
+			nestedRoot, relErr := filepath.Rel(repoDir, filepath.Dir(path))
+			if relErr != nil {
+				nestedRoot = rel
+			}
+			return fmt.Errorf("unversioned path %q contains a nested Subversion working copy; review it separately", filepath.ToSlash(nestedRoot))
+		}
+		child, err := filepath.Rel(repoDir, path)
+		if err != nil {
+			return nil
+		}
+		child = filepath.ToSlash(child)
+		if entry.IsDir() {
+			if path != fullPath && IsPathExcluded(repoDir, child, patterns) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !entry.Type().IsRegular() && entry.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		if !IsPathExcluded(repoDir, child, patterns) {
+			seen[child] = struct{}{}
+		}
+		return nil
+	})
+}
+
+func removeSVNPropertyOnlyDiffs(diffs []model.Diff) []model.Diff {
+	result := make([]model.Diff, 0, len(diffs))
+	for _, d := range diffs {
+		if d.Insertions == 0 && d.Deletions == 0 && !d.IsBinary && !d.IsNew && !d.IsDeleted {
+			continue
+		}
+		result = append(result, d)
+	}
+	return result
+}

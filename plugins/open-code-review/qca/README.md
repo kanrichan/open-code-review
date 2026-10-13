@@ -18,9 +18,9 @@ key is required.
 
 The environment referenced by the template must provide:
 
-- Git 2.41 or later.
+- Git 2.41 or later for Git reviews, and an `svn` 1.7+ command-line client for SVN reviews.
 - A compatible `ocr` binary on `PATH`.
-- A checked-out repository as the session workspace.
+- A checked-out Git repository or SVN working copy as the session workspace. An absolute remote SVN target pair may instead use a plain directory that contains OCR rules/configuration.
 
 For production, preinstall and pin OCR in the runtime image. Installing the
 latest NPM package during every session adds network, startup, and compatibility
@@ -55,6 +55,14 @@ state transition idempotency. Report medium-severity and higher findings.
 Review commit abc123.
 ```
 
+```text
+Review SVN revisions 120 through 128 exactly. Do not use merge-base semantics.
+```
+
+```text
+Compare SVN trunk@120 with branches/order-refactor@128 using explicit remote targets.
+```
+
 ## Execution contract
 
 The QCA agent must:
@@ -75,9 +83,10 @@ credentials.
 
 ## Validation
 
-- `ocr delegate preview --format json` returns `schema_version: "1"`.
+- `ocr delegate preview --format json` returns `schema_version: "1"` and a `vcs` value.
 - All previewed files are accounted for in the final response.
 - Write and Edit are disabled. Bash read-only behavior is prompt-enforced unless
   the QCA runtime applies a stricter command policy.
 - The session completes without `OCR_LLM_*` variables.
-- Workspace, branch range, and single-commit reviews all work.
+- Git and SVN workspace, range, and single-revision reviews all work.
+- Remote SVN comparisons pass both target flags, keep target URLs out of output, and use the frozen operative/peg revisions returned by preview.

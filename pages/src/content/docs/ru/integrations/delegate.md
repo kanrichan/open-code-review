@@ -68,8 +68,9 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 
 Вывод содержит:
 
+- **vcs** — git / svn;
 - **режим** — workspace / range / commit;
-- **метаданные ссылок** — from, to, commit, merge\_base;
+- **метаданные ссылок** — from, to, commit, merge\_base и безопасные разрешённые operative/peg-ревизии SVN;
 - **список проверяемых файлов** — пути, статусы, добавления/удаления;
 - **исключённые файлы** — с причиной исключения.
 
@@ -79,6 +80,7 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 |----------|---------|
 | Изменения рабочей области | `ocr delegate preview` |
 | Сравнение веток | `ocr delegate preview --from main --to feature` |
+| Удалённые пути SVN | `ocr delegate preview --from 120 --to 128 --svn-from-target <old-url@peg> --svn-to-target <new-url@peg>` |
 | Один коммит | `ocr delegate preview -c abc123` |
 
 ### Шаг 2. Получить правила для файлов
@@ -93,7 +95,7 @@ ocr delegate rule <path1> <path2> ...
 
 ### Шаг 3. Получить diff
 
-Выберите команду diff по режиму и ссылкам из шага 1. При каждом вызове Git во время ревью используйте `git --no-pager`.
+Выберите команду diff по VCS, режиму и ссылкам из шага 1. При каждом вызове Git во время ревью используйте `git --no-pager`.
 
 Следующие команды diff отключают внешние diff-программы, преобразование текста и цветной вывод, чтобы получить патчи в виде обычного текста.
 
@@ -107,10 +109,51 @@ git --no-pager diff --no-ext-diff --no-textconv --no-color <merge_base>..<to> --
 git --no-pager show --no-ext-diff --no-textconv --no-color <commit> -- "<path>"
 ```
 
+Для режима диапазона или коммита SVN сначала выполните
+`svn info --xml --non-interactive --depth empty -- .` и прочитайте значение
+`<url>`. Эта XML-форма доступна во всём поддерживаемом диапазоне SVN 1.7+.
+Затем используйте числовые `resolved_base` и `resolved_head`, возвращённые preview:
+
+```bash
+svn diff --git --internal-diff --show-copies-as-adds --old <working-copy-url>@<resolved_base> --new <working-copy-url>@<resolved_head>
+svn cat --revision <resolved_head> -- <working-copy-url>/<url-escaped-path>@<resolved_head>
+```
+
+Явные peg-ревизии URL отделяют diff и содержимое назначения от грязной,
+устаревшей или mixed-revision рабочей копии.
+
+Для явного сравнения путей репозитория передайте preview параметры
+`--svn-from-target` и `--svn-to-target`. JSON намеренно не повторяет URL;
+сохраните их во входных данных runtime host agent, отделите каждый URL от
+необязательного peg-суффикса и используйте URL-части вместе с безопасными
+числовыми полями `resolved_base`, `resolved_head`, `resolved_base_peg` и
+`resolved_head_peg`:
+
+```bash
+ocr delegate preview --format json \
+  --from 120 --to 128 \
+  --svn-from-target 'https://svn.example.com/repos/app/trunk@120' \
+  --svn-to-target 'https://svn.example.com/repos/app/branches/feature@128'
+
+svn info --xml --non-interactive --revision <resolved_base> -- <source-target-url>@<resolved_base_peg>
+svn info --xml --non-interactive --revision <resolved_head> -- <destination-target-url>@<resolved_head_peg>
+
+svn diff --non-interactive --git --internal-diff --show-copies-as-adds \
+  --notice-ancestry \
+  --old <source-url-from-info>@<resolved_base> \
+  --new <destination-url-from-info>@<resolved_head>
+```
+
+Сравниваются точные конечные точки SVN без семантики Git merge-base. Сначала
+разрешаются исторические URL, поэтому перемещения путей сохраняются. Целевое
+содержимое читается по destination URL, который `svn info` вернул для
+`resolved_head`.
+
 **Режим рабочей области**:
 ```bash
-git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # tracked files
-cat "<path>"                     # new untracked files
+git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # файлы под управлением Git
+svn diff --git --internal-diff --show-copies-as-adds -- <path>                     # файлы под управлением SVN
+cat "<path>"                     # неотслеживаемые Git / неверсионируемые SVN файлы
 ```
 
 Для получения контекста:
@@ -151,7 +194,7 @@ git --no-pager diff --no-ext-diff --no-textconv --no-color --output="<absolute-d
 
 | Команда | Назначение |
 |---------|---------|
-| `ocr delegate preview` | Выводит проверяемые файлы и метаданные режима/ссылок. |
+| `ocr delegate preview` | Выводит проверяемые файлы и метаданные VCS/режима/ссылок. |
 | `ocr delegate rule <path...>` | Разрешает правила ревью и группирует их по содержимому. |
 
 ## Общие флаги
@@ -160,6 +203,8 @@ git --no-pager diff --no-ext-diff --no-textconv --no-color --output="<absolute-d
 |------|-------------|
 | `--from <ref>` | Исходная ссылка для режима диапазона. |
 | `--to <ref>` | Целевая ссылка для режима диапазона. |
+| `--svn-from-target <url[@peg]>` | Исходный каталог SVN точного удалённого диапазона. |
+| `--svn-to-target <url[@peg]>` | Целевой каталог SVN точного удалённого диапазона. |
 | `-c, --commit <hash>` | Режим одного коммита. |
 | `--repo <path>` | Корень репозитория (по умолчанию текущий рабочий каталог). |
 | `--rule <path>` | Путь к пользовательскому rule.json. |

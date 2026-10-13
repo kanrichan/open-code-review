@@ -42,6 +42,7 @@ type SessionHistory struct {
 	mu           sync.Mutex
 	SessionID    string
 	RepoDir      string
+	VCS          string
 	GitBranch    string
 	Model        string
 	LLMSource    string
@@ -131,6 +132,7 @@ type ToolResultRecord struct {
 
 // SessionOptions holds optional metadata for a new session.
 type SessionOptions struct {
+	VCS         string
 	ReviewMode  string
 	DiffFrom    string
 	DiffTo      string
@@ -160,6 +162,7 @@ func New(repoDir, gitBranch, model string, opts SessionOptions) *SessionHistory 
 	sh := &SessionHistory{
 		SessionID:    sessionID,
 		RepoDir:      repoDir,
+		VCS:          opts.VCS,
 		GitBranch:    gitBranch,
 		Model:        model,
 		LLMSource:    opts.LLMSource,

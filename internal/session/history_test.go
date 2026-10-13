@@ -17,6 +17,7 @@ import (
 
 func TestNew(t *testing.T) {
 	sh := New("/tmp/repo", "main", "gpt-4", SessionOptions{
+		VCS:        "git",
 		ReviewMode: ReviewModeWorkspace,
 		DiffFrom:   "a",
 		DiffTo:     "b",
@@ -33,6 +34,9 @@ func TestNew(t *testing.T) {
 	}
 	if sh.GitBranch != "main" {
 		t.Errorf("GitBranch = %q", sh.GitBranch)
+	}
+	if sh.VCS != "git" {
+		t.Errorf("VCS = %q", sh.VCS)
 	}
 	if sh.Model != "gpt-4" {
 		t.Errorf("Model = %q", sh.Model)

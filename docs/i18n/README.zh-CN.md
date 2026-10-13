@@ -44,7 +44,7 @@
 
 Open Code Review 是一款 AI 驱动的代码审查 CLI 工具。它的前身是阿里集团内部官方 AI 代码审查助手，过去两年在内部服务了数万开发者，识别了数百万个代码缺陷。经过大规模充分验证后，我们将其孵化为开源项目，对社区开放。只需配置一个模型端点即可使用。
 
-它读取 Git diff，通过具备工具调用能力的 Agent 将变更文件发送至可配置的 LLM，生成具有行级精度的结构化审查意见。Agent 可以读取完整文件内容、搜索代码库、检查其他变更文件以获取上下文，从而进行深度审查——而非仅停留在表面的 diff 反馈。除了 diff 审查，`ocr scan` 可以审查整个文件，适用于审计不熟悉的代码库或没有有意义 diff 的目录。
+它读取 Git 及 Subversion 工作副本的 diff，通过具备工具调用能力的 Agent 将变更文件发送至可配置的 LLM，生成具有行级精度的结构化审查意见。Agent 可以读取完整文件内容、搜索代码库、检查其他变更文件以获取上下文，从而进行深度审查——而非仅停留在表面的 diff 反馈。除了 diff 审查，`ocr scan` 可以审查整个文件，适用于审计不熟悉的代码库或没有有意义 diff 的目录。
 
 访问[官方网站](https://open-codereview.ai)了解更多信息。
 
@@ -104,7 +104,8 @@ Open Code Review 的核心设计理念是将确定性工程与 Agent 结合，�
 
 ### 前置条件
 
-- **Git >= 2.41** — Open Code Review 依赖 Git 进行 diff 生成、代码搜索和仓库操作。
+- **Git >= 2.41** — Git 工作区、commit 与范围评审需要此版本。
+- **Subversion >= 1.7（可选）** — SVN 工作区、revision 与 revision 范围评审需要此版本。
 
 ### CLI
 
@@ -140,13 +141,21 @@ ocr config model             # 为当前供应商选择模型
 ```bash
 cd your-project
 
-# 工作区模式 —— 审查所有暂存、未暂存和未跟踪的变更
+# Git 工作区 —— 审查所有暂存、未暂存和未跟踪的变更
 ocr review
 
-# 分支范围 —— 评审 feature-branch 与 main 分叉后的变更（合并基准模式）
+# Subversion 工作副本 —— 审查已纳管和未纳管的本地变更
+cd your-svn-working-copy
+ocr review
+
+# 不可变的 Subversion 历史 —— 单个 revision 或明确的 revision 范围
+ocr review --commit 128
+ocr review --from 120 --to 128
+
+# Git 分支范围 —— 评审 feature-branch 自与 main 分叉以来的变更（合并基准模式）
 ocr review --from main --to feature-branch
 
-# 单个提交
+# 单个 Git 提交
 ocr review --commit abc123
 
 # 恢复中断的区间或单 commit 评审

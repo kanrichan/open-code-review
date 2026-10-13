@@ -16,6 +16,8 @@ import (
 
 	"github.com/alibaba/open-code-review/internal/gitcmd"
 	"github.com/alibaba/open-code-review/internal/pathutil"
+	"github.com/alibaba/open-code-review/internal/svncmd"
+	"github.com/alibaba/open-code-review/internal/vcs"
 )
 
 // ReviewMode represents the active review mode.
@@ -24,9 +26,9 @@ type ReviewMode int
 const (
 	// ModeWorkspace reads files from the current working tree.
 	ModeWorkspace ReviewMode = iota
-	// ModeRange reads files as they exist at a specific git ref (--to value).
+	// ModeRange reads files as they exist at the immutable destination endpoint.
 	ModeRange
-	// ModeCommit reads files as they exist at a specific commit hash.
+	// ModeCommit reads files as they exist at one immutable revision.
 	ModeCommit
 )
 
@@ -41,8 +43,8 @@ func ParseReviewMode(from, to, commit string) ReviewMode {
 	return ModeWorkspace
 }
 
-// RefValue returns the git ref that should be used for reading file contents
-// in range or commit mode. Returns ("", false) for workspace mode.
+// RefValue returns the requested destination ref or revision for range or
+// commit mode. Returns ("", false) for workspace mode.
 func (m ReviewMode) RefValue(toRef, commit string) (string, bool) {
 	switch m {
 	case ModeRange:
@@ -57,26 +59,83 @@ func (m ReviewMode) RefValue(toRef, commit string) (string, bool) {
 // FileReader resolves file contents according to the active review mode.
 type FileReader struct {
 	RepoDir string
-	Mode    ReviewMode
-	// Ref is the git ref to use for ModeRange (--to) or ModeCommit (--commit).
+	// RepositoryKind lets workspace tools avoid a needless Git dependency in a
+	// Subversion working copy. The zero value preserves historical behavior.
+	RepositoryKind vcs.Kind
+	Mode           ReviewMode
+	// Ref is the frozen Git ref or numeric SVN revision used for immutable reads.
 	// Empty for ModeWorkspace.
-	Ref    string
-	Runner *gitcmd.Runner
+	Ref string
+	// SVNTarget is the selected or historically resolved destination URL. It is
+	// runtime-only and may contain routing details, so it must never be persisted.
+	SVNTarget string
+	// SVNPegRevision is the frozen peg used to locate SVNTarget. It can differ
+	// from Ref when a path moved between the operative endpoints.
+	SVNPegRevision string
+	Runner         *gitcmd.Runner
+	// SVNOutput optionally overrides SVN command execution for tests.
+	SVNOutput func(context.Context, ...string) ([]byte, error)
 }
 
 // Read returns the full content of a file path (relative to RepoDir),
 // resolved according to the active review mode.
 // - Workspace: reads directly from the filesystem.
-// - Range / Commit: uses `git show <Ref>:<path>` to read at the given ref.
+// - Range / Commit: reads from the destination Git commit or SVN revision.
 func (fr *FileReader) Read(ctx context.Context, path string) (string, error) {
 	switch fr.Mode {
 	case ModeWorkspace:
 		return fr.readFromDisk(path)
 	case ModeRange, ModeCommit:
+		if fr.RepositoryKind == vcs.Subversion {
+			return fr.readFromSVN(ctx, path)
+		}
 		return fr.readFromGitShow(ctx, path)
 	default:
 		return fr.readFromDisk(path)
 	}
+}
+
+func (fr *FileReader) readFromSVN(parentCtx context.Context, path string) (string, error) {
+	if fr.Ref == "" || fr.SVNTarget == "" {
+		return "", fmt.Errorf("immutable Subversion file read is missing a target or revision")
+	}
+	peg := fr.SVNPegRevision
+	if peg == "" {
+		peg = fr.Ref
+	}
+	target, err := svncmd.ChildTarget(fr.SVNTarget, path, peg)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+	defer cancel()
+	output, err := fr.runSVNOutput(ctx, "cat", "--non-interactive", "--revision", fr.Ref, "--", target)
+	if err != nil {
+		return "", fmt.Errorf("svn cat %s at revision %s: %w", path, fr.Ref, err)
+	}
+	return string(output), nil
+}
+
+func (fr *FileReader) runSVNOutput(ctx context.Context, args ...string) ([]byte, error) {
+	if fr.SVNOutput != nil {
+		return fr.SVNOutput(ctx, args...)
+	}
+	return svncmd.Output(ctx, fr.RepoDir, args...)
+}
+
+func (fr *FileReader) listSVNFiles(ctx context.Context) ([]string, error) {
+	if fr.Ref == "" || fr.SVNTarget == "" {
+		return nil, fmt.Errorf("immutable Subversion file listing is missing a target or revision")
+	}
+	peg := fr.SVNPegRevision
+	if peg == "" {
+		peg = fr.Ref
+	}
+	out, err := fr.runSVNOutput(ctx, "list", "--xml", "--recursive", "--non-interactive", "--revision", fr.Ref, "--", svncmd.PegTarget(fr.SVNTarget, peg))
+	if err != nil {
+		return nil, err
+	}
+	return svncmd.ParseList(out)
 }
 
 func (fr *FileReader) readFromDisk(path string) (string, error) {
@@ -144,6 +203,13 @@ func (fr *FileReader) ReadLines(ctx context.Context, path string, startLine, max
 	case ModeWorkspace:
 		return fr.readLinesFromDisk(path, startLine, maxLines)
 	case ModeRange, ModeCommit:
+		if fr.RepositoryKind == vcs.Subversion {
+			content, err := fr.readFromSVN(ctx, path)
+			if err != nil {
+				return nil, 0, err
+			}
+			return scanLines(strings.NewReader(content), startLine, maxLines)
+		}
 		innerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		return fr.readLinesFromGitShow(innerCtx, path, startLine, maxLines)

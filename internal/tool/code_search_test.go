@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/alibaba/open-code-review/internal/gitcmd"
+	"github.com/alibaba/open-code-review/internal/vcs"
 )
 
 func TestBuildGrepArgs_WorkspaceMode(t *testing.T) {
@@ -535,6 +536,124 @@ func TestGitGrep_NonGitDirectoryNoMatch(t *testing.T) {
 	}
 }
 
+func TestCodeSearch_SubversionWorkspaceDoesNotRequireGit(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("main.go", "package main\n\nfunc HandleRequest() {}\n")
+	write("internal/service.go", "package internal\n\nfunc handleRequest() {}\n")
+	write("node_modules/ignored.js", "function HandleRequest() {}\n")
+
+	p := NewCodeSearch(&FileReader{
+		RepoDir:        dir,
+		Mode:           ModeWorkspace,
+		RepositoryKind: vcs.Subversion,
+	})
+	result, err := p.gitGrep(context.Background(), "HandleRequest", true, false, []string{"**/*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "main.go") {
+		t.Fatalf("expected main.go in result, got: %s", result)
+	}
+	if strings.Contains(result, "service.go") || strings.Contains(result, "node_modules") {
+		t.Fatalf("unexpected case-insensitive or excluded match: %s", result)
+	}
+}
+
+func TestCodeSearch_SubversionWorkspaceRegexp(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc Handle42() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := NewCodeSearch(&FileReader{
+		RepoDir:        dir,
+		Mode:           ModeWorkspace,
+		RepositoryKind: vcs.Subversion,
+	})
+
+	result, err := p.gitGrep(context.Background(), `handle\d+`, false, true, []string{"*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "main.go") {
+		t.Fatalf("expected regexp match in main.go, got: %s", result)
+	}
+
+	result, err = p.gitGrep(context.Background(), "(unclosed", false, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(result, "Error: invalid regular expression:") {
+		t.Fatalf("expected invalid regexp error, got: %s", result)
+	}
+}
+
+func TestCodeSearchSubversionRevision(t *testing.T) {
+	fr := &FileReader{
+		RepoDir:        t.TempDir(),
+		Mode:           ModeCommit,
+		Ref:            "12",
+		SVNTarget:      "https://svn.example.com/project/trunk",
+		RepositoryKind: vcs.Subversion,
+	}
+	fr.SVNOutput = func(_ context.Context, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "list":
+			return []byte(`<lists><list><entry kind="file"><name>src/main.go</name></entry><entry kind="file"><name>src/other.go</name></entry></list></lists>`), nil
+		case "cat":
+			target := args[len(args)-1]
+			if strings.Contains(target, "main.go") {
+				return []byte("package main\nfunc FrozenValue() int { return 12 }\n"), nil
+			}
+			return []byte("package other\n"), nil
+		default:
+			return nil, errors.New("unexpected SVN command")
+		}
+	}
+	p := NewCodeSearch(fr)
+	result, err := p.gitGrep(context.Background(), "FrozenValue", true, false, []string{"src/*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "File: src/main.go") || !strings.Contains(result, "2|func FrozenValue") {
+		t.Fatalf("unexpected result: %s", result)
+	}
+	if strings.Contains(result, "other.go") {
+		t.Fatalf("unmatched file leaked into result: %s", result)
+	}
+}
+
+func TestMatchesSearchPathspecExclusions(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		patterns []string
+		want     bool
+	}{
+		{name: "positive", path: "pkg/main.go", patterns: []string{"*.go"}, want: true},
+		{name: "excluded", path: "pkg/main_test.go", patterns: []string{"*.go", ":(exclude)*_test.go"}, want: false},
+		{name: "only exclusion keeps other files", path: "pkg/main.go", patterns: []string{":(exclude)*_test.go"}, want: true},
+		{name: "only exclusion drops match", path: "pkg/main_test.go", patterns: []string{":(exclude)*_test.go"}, want: false},
+		{name: "short exclusion", path: "vendor/lib.go", patterns: []string{":!vendor/"}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := matchesSearchPathspec(test.path, test.patterns); got != test.want {
+				t.Errorf("matchesSearchPathspec(%q, %v) = %v, want %v", test.path, test.patterns, got, test.want)
+			}
+		})
+	}
+}
+
 func TestCodeSearchProvider_Tool(t *testing.T) {
 	p := NewCodeSearch(&FileReader{RepoDir: "/tmp"})
 	if p.Tool() != CodeSearch {
@@ -628,6 +747,7 @@ func TestCodeSearchProvider_Execute_RejectsTraversalPattern(t *testing.T) {
 		{name: "leading parent backslash", pattern: `..\pkg`, want: "Error: file_patterns must not contain .."},
 		{name: "middle parent backslash", pattern: `pkg\..\internal`, want: "Error: file_patterns must not contain .."},
 		{name: "trailing parent backslash", pattern: `pkg\..`, want: "Error: file_patterns must not contain .."},
+		{name: "excluded parent", pattern: ":(exclude)../pkg", want: "Error: file_patterns must not contain .."},
 	}
 
 	for _, test := range tests {

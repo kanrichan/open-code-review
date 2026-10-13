@@ -58,8 +58,9 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 
 出力内容：
 
+- **vcs** — git / svn
 - **mode** — workspace / range / commit
-- **ref メタデータ** — from、to、commit、merge\_base
+- **ref メタデータ** — from、to、commit、merge\_base、および安全な解決済み SVN operative/peg revision
 - **レビュー可能ファイルリスト** — パス、ステータス、挿入/削除行数
 - **除外ファイル** — 除外理由付き
 
@@ -69,6 +70,7 @@ ocr delegate preview [--from <ref> --to <ref>] [--commit <hash>] [--exclude <pat
 |----------|---------|
 | ワークスペースの変更 | `ocr delegate preview` |
 | ブランチ比較 | `ocr delegate preview --from main --to feature` |
+| リモート SVN パス | `ocr delegate preview --from 120 --to 128 --svn-from-target <old-url@peg> --svn-to-target <new-url@peg>` |
 | 単一コミット | `ocr delegate preview -c abc123` |
 
 ### ステップ 2：ファイルのルール取得
@@ -81,7 +83,7 @@ ocr delegate rule <path1> <path2> ...
 
 ### ステップ 3：diff の取得
 
-ステップ 1 のモードと参照情報に応じて diff コマンドを選びます。レビュー中のすべての Git 呼び出しで `git --no-pager` を使います。
+ステップ 1 の VCS、モード、参照情報に応じて diff コマンドを選びます。レビュー中のすべての Git 呼び出しで `git --no-pager` を使います。
 
 以下の diff コマンドは外部 diff プログラム、テキスト変換、カラー出力を無効にして、プレーンテキストのパッチを取得します。
 
@@ -95,10 +97,48 @@ git --no-pager diff --no-ext-diff --no-textconv --no-color <merge_base>..<to> --
 git --no-pager show --no-ext-diff --no-textconv --no-color <commit> -- "<path>"
 ```
 
+SVN の Range または Commit モードでは、まず
+`svn info --xml --non-interactive --depth empty -- .` を実行して `<url>` 値を読み取ります。
+この XML 形式は、サポート対象の SVN 1.7+ 全体で利用できます。次に preview が返す数値
+`resolved_base` と `resolved_head` を使用します。
+
+```bash
+svn diff --git --internal-diff --show-copies-as-adds --old <working-copy-url>@<resolved_base> --new <working-copy-url>@<resolved_head>
+svn cat --revision <resolved_head> -- <working-copy-url>/<url-escaped-path>@<resolved_head>
+```
+
+明示的な URL peg により、dirty、古い、または mixed-revision のワーキングコピーから diff と宛先コンテンツを分離できます。
+
+リポジトリパスを明示的に比較する場合、preview に `--svn-from-target` と
+`--svn-to-target` を渡します。JSON は URL を意図的に出力しません。host agent の
+runtime input に URL を保持し、各 URL と省略可能な peg suffix を分離したうえで、
+URL 部分を安全な数値フィールド `resolved_base`、`resolved_head`、
+`resolved_base_peg`、`resolved_head_peg` と組み合わせます。
+
+```bash
+ocr delegate preview --format json \
+  --from 120 --to 128 \
+  --svn-from-target 'https://svn.example.com/repos/app/trunk@120' \
+  --svn-to-target 'https://svn.example.com/repos/app/branches/feature@128'
+
+svn info --xml --non-interactive --revision <resolved_base> -- <source-target-url>@<resolved_base_peg>
+svn info --xml --non-interactive --revision <resolved_head> -- <destination-target-url>@<resolved_head_peg>
+
+svn diff --non-interactive --git --internal-diff --show-copies-as-adds \
+  --notice-ancestry \
+  --old <source-url-from-info>@<resolved_base> \
+  --new <destination-url-from-info>@<resolved_head>
+```
+
+これは厳密な SVN 端点の比較であり、Git merge-base は適用しません。先に履歴 URL を
+解決することでパス移動も保持します。宛先内容は `svn info` が `resolved_head` で返す
+destination URL から読み取ります。
+
 **Workspace モード**：
 ```bash
-git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # 追跡ファイル
-cat "<path>"                     # 新規未追跡ファイル
+git --no-pager diff --no-ext-diff --no-textconv --no-color HEAD -- "<path>"        # Git 追跡ファイル
+svn diff --git --internal-diff --show-copies-as-adds -- <path>                     # SVN 管理対象ファイル
+cat "<path>"                     # Git 未追跡 / SVN 未管理ファイル
 ```
 
 コンテキストを取得するには：
@@ -139,7 +179,7 @@ preview の各 `(path, status)` を `reviewed` または `skipped` として記�
 
 | コマンド | 目的 |
 |----------|------|
-| `ocr delegate preview` | レビュー可能ファイル＋mode/ref メタデータの一覧 |
+| `ocr delegate preview` | レビュー可能ファイル＋VCS/mode/ref メタデータの一覧 |
 | `ocr delegate rule <path...>` | 内容別にグループ化されたレビュールールの解決 |
 
 ## 共通フラグ
@@ -148,6 +188,8 @@ preview の各 `(path, status)` を `reviewed` または `skipped` として記�
 |--------|------|
 | `--from <ref>` | Range モードのソース参照 |
 | `--to <ref>` | Range モードのターゲット参照 |
+| `--svn-from-target <url[@peg]>` | 厳密なリモート範囲のソース SVN ディレクトリ |
+| `--svn-to-target <url[@peg]>` | 厳密なリモート範囲の宛先 SVN ディレクトリ |
 | `-c, --commit <hash>` | 単一コミットモード |
 | `--repo <path>` | リポジトリルート（デフォルト：cwd） |
 | `--rule <path>` | カスタム rule.json パス |

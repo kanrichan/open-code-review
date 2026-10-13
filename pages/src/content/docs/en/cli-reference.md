@@ -91,8 +91,8 @@ ocr review --commit HEAD | gh issue comment 123 --body-file -
 
 ## `ocr review`
 
-The main command. Resolves a Git diff, groups the changed files
-semantically, dispatches one sub-agent per group, collects review
+The main command. Resolves a Git or Subversion working-copy diff, groups the
+changed files semantically, dispatches one sub-agent per group, collects review
 comments, and prints them.
 
 ### Synopsis
@@ -102,17 +102,19 @@ ocr review [flags]
 ocr r      [flags]   (alias)
 ```
 
-If no flags are passed, OCR runs in **workspace mode** — review of all
-staged + unstaged + untracked changes in the current directory's repo.
+If no flags are passed, OCR runs in **workspace mode** and reviews all local
+Git or Subversion working-copy changes.
 
 ### Flags
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--repo <path>` | — | current dir | Git repository root. |
-| `--from <ref>` | — | — | Source ref to start the diff from (e.g., `main`). |
-| `--to <ref>` | — | — | Target ref to end the diff at (e.g., `feature-branch`). When set, OCR computes `merge-base(from, to)..to`. |
-| `--commit <sha>` | `-c` | — | Single commit to review (vs its parent). |
+| `--repo <path>` | — | current dir | Git or Subversion working-copy root. For an explicit remote SVN comparison, this may instead be a plain directory containing OCR rules/configuration. |
+| `--from <ref>` | — | — | Source Git ref or SVN revision. Git uses merge-base semantics; SVN uses the exact resolved revision. |
+| `--to <ref>` | — | — | Destination Git ref or SVN revision. Git computes `merge-base(from, to)..to`; SVN compares the exact endpoints. |
+| `--commit <ref>` | `-c` | — | Single Git commit or SVN revision to review against its predecessor. |
+| `--svn-from-target <url[@peg]>` | — | — | Source SVN directory target for a remote range comparison. Must be paired with `--svn-to-target` and `--from`/`--to`. |
+| `--svn-to-target <url[@peg]>` | — | — | Destination SVN directory target. Destination file tools read this target at the frozen operative and peg revisions. |
 | `--preview` | `-p` | `false` | Run the filter pipeline but skip the LLM. Prints the file list and exclusion reasons. Honors `--format json`; `--format sarif` is not supported (a preview has no completed findings to emit). |
 | `--no-filter` | — | `false` | Keep all review comments and skip the per-subtask `REVIEW_FILTER_TASK` LLM post-processing call. A subtask reviews a single file or a bundle of related files. |
 | `--resume <session-id>` | — | — | Resume from a previous compatible range or commit review session. |
@@ -171,7 +173,7 @@ provider. Custom providers retain their existing `--model` validation rules.
 ocr review
 ```
 
-OCR assembles the working-tree changes from two git commands:
+In Git, OCR assembles the working-tree changes from two commands:
 
 - tracked changes via `git diff HEAD` (staged + unstaged combined against
   `HEAD`; if that comes back empty, OCR falls back to `git diff --staged`)
@@ -180,6 +182,33 @@ OCR assembles the working-tree changes from two git commands:
 
 This is what you usually want pre-commit. Stage selectively if you want
 narrower scope.
+
+In a Subversion working copy, OCR first checks `svn --version --quiet`; client
+version 1.7 or newer is required for the Git-compatible diff capabilities it
+uses. In workspace mode, it combines `svn diff --git` with unversioned files
+reported by `svn status --xml`. Property-only changes are ignored because they
+have no line-addressable source change.
+
+SVN workspace edge cases have these explicit semantics:
+
+- A copy is rendered as a full-file addition with repository-root-relative
+  copy-from path and revision metadata. A move is a copied addition plus a
+  separate deletion. A replacement is likewise a deletion plus an addition.
+- Binary content changes and MIME-marked binary files are identified as binary.
+  Executable, EOL, MIME, and other property-only changes are ignored because
+  they have no line-addressable source change. When content also changes, the
+  content or binary change is kept and property text is omitted.
+- Mixed-BASE-revision working copies are supported because every node is diffed
+  against its own BASE. Switched, sparse, obstructed, incomplete, or conflicted
+  working copies are rejected before diff loading.
+- `svn:externals` definitions and checked-out external nodes are rejected. Run
+  OCR separately at each external's own working-copy root; this prevents file
+  tools from crossing the selected repository boundary.
+- XML paths are authoritative when console output loses Unicode characters on
+  Windows. Spaces and `@` in names are preserved, and SVN commands target the
+  working-copy root after `--`, so a filename is never parsed as peg syntax.
+- Inspection uses a fixed number of recursive SVN commands rather than one
+  process per file. Commands remain sequential, bounded, and cancellable.
 
 #### Range mode
 
@@ -191,6 +220,46 @@ OCR computes `merge-base(main, feature-branch)..feature-branch` so you only
 see the diff *introduced by* the feature branch — not unrelated changes
 that landed on `main` since branching.
 
+For SVN, both values are revisions and OCR compares the exact frozen endpoints:
+
+```bash
+ocr review --from 120 --to 128
+```
+
+Numeric revisions, `HEAD`, and `{DATE}` revisions are accepted. Moving or
+date-based values are resolved to repository-wide numbers before diff loading,
+file tools, filtering, manifest creation, or resume identity checks. The
+working-copy-relative keywords `BASE`, `COMMITTED`, and `PREV` are rejected
+because mixed-revision working copies make them ambiguous.
+
+To compare two repository paths—such as trunk and a branch after a server-side
+merge—provide both targets explicitly:
+
+```bash
+ocr review \
+  --repo ./ocr-config \
+  --from 120 \
+  --to 128 \
+  --svn-from-target 'https://svn.example.com/repos/app/trunk@120' \
+  --svn-to-target 'https://svn.example.com/repos/app/branches/feature@128'
+```
+
+This is an exact SVN comparison: operative revisions are `120:128`, while the
+two `@PEG` values identify the historical source and destination paths. OCR
+does **not** invent a Git merge base. Both targets must be directories in the
+same SVN repository. A working copy is optional when absolute URLs are used;
+`^/` targets require `--repo` to point to an SVN working copy.
+
+All operative and peg spellings, including `HEAD` and `{DATE}`, are resolved
+once to numeric revisions before `svn diff`, `svn cat`, filtering, or resume
+identity is computed. Paths from the diff are normalized relative to the two
+selected directory targets, and destination content is always read from
+`--svn-to-target`, never from disk. Commands run with `--non-interactive` so a
+hook cannot hang on a prompt. Preconfigure the SVN authentication and server
+certificate cache available to the hook account. URLs containing userinfo,
+query strings, or fragments are rejected, and target URLs are never written to
+manifests, session logs, delegate JSON, or telemetry.
+
 #### Commit mode
 
 ```bash
@@ -200,6 +269,11 @@ ocr review -c abc123
 
 Reviews the diff produced by `git show abc123` (i.e., the changes that
 single commit introduced).
+
+For SVN, `--commit 128` reviews the exact `127:128` change scoped to the
+working-copy URL. Revision 0 is an empty input because it has no predecessor.
+New-file content and repository search tools read revision 128 rather than the
+current working tree.
 
 ### Resuming interrupted reviews
 
@@ -541,7 +615,7 @@ Rule introspection. There is exactly one subcommand:
 ocr rules check [flags] <file-path>
 
 Flags:
-  --repo <path>    Git repository root (default: current dir)
+  --repo <path>    Git/SVN working-copy root, or config directory for scan/remote SVN (default: current dir)
   --rule <path>    Path to a custom rule JSON file
 ```
 
