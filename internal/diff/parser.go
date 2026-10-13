@@ -173,6 +173,9 @@ func parseDiffTextWithReader(ctx context.Context, diffText string, readContent d
 func finalizeDiff(ctx context.Context, d *model.Diff, readContent diffContentReader) {
 	if d.IsDeleted || d.NewPath == "/dev/null" {
 		d.NewPath = "/dev/null"
+		// No new-file bytes exist, but the hunk still carries deleted lines
+		// the model will read. Detect on the payload itself.
+		decodeDiffFile(d, nil)
 		return
 	}
 	if d.IsBinary {
@@ -181,7 +184,9 @@ func finalizeDiff(ctx context.Context, d *model.Diff, readContent diffContentRea
 	content, err := readContent(ctx, d.NewPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ocr] WARNING: cannot read file %s for review: %v\n", d.NewPath, err)
+		decodeDiffFile(d, nil)
 		return
 	}
 	d.NewFileContent = string(content)
+	decodeDiffFile(d, content)
 }
